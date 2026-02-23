@@ -48,6 +48,8 @@ from cellregpy import (
     initial_registration_centroid_distances_custom,
     initial_registration_spatial_corr,
     cluster_cells_matlab,
+    combine_p_same,
+    cluster_cells_consensus,
     estimate_registration_accuracy,
     MeanImageAligner,
 )
@@ -1362,11 +1364,204 @@ def run_pipeline(folder_path: str):
     print("  ✓ Pairwise session overlap figure done")
 
     # ================================================================== #
+    #  STAGE 6 — Dual-model comparison (experimental)
+    # ================================================================== #
+    print("\n--- Stage 6: Dual-model comparison (experimental) ---")
+
+    # --- Option 1: Consensus clustering ---
+    (consensus_map,
+     map_centroid_only,
+     map_spatial_only,
+     n_centroid,
+     n_spatial) = cluster_cells_consensus(
+        cell_to_index_map=cell_to_index_map,
+        p_same_centroid=p_same_centroid,
+        p_same_spatial=p_same_spatial,
+        all_to_all_indexes=data_dist['all_to_all_indexes'],
+        maximal_distance=normalized_maximal_distance,
+        registration_threshold=p_same_threshold,
+        centroid_locations=aligned_centroid_locations,
+        registration_approach=registration_approach,
+        verbose=True,
+    )
+
+    # --- Option 2: Combined p_same ---
+    print("  [Combined] Computing p_centroid × p_spatial...")
+    p_same_combined = combine_p_same(p_same_centroid, p_same_spatial)
+
+    (combined_map,
+     _combined_centroids,
+     _combined_scores) = cluster_cells_matlab(
+        cell_to_index_map=cell_to_index_map,
+        all_to_all_p_same=p_same_combined,
+        all_to_all_indexes=data_dist['all_to_all_indexes'],
+        maximal_distance=normalized_maximal_distance,
+        registration_threshold=p_same_threshold,
+        centroid_locations=aligned_centroid_locations,
+        registration_approach=registration_approach,
+        transform_data=False,
+        verbose=False,
+    )
+    print(f"  [Combined] {combined_map.shape[0]} clusters")
+
+    # --- Helper for counting cells present in all sessions ---
+    def _count_all_sessions(cmap, n_sess):
+        if cmap.shape[0] == 0:
+            return 0
+        present = np.sum(cmap > 0, axis=1)
+        return int(np.sum(present == n_sess))
+
+    # --- Option 3: Centroid-primary with spatial floor filter ---
+    # Logic: centroid distance drives matching; spatial correlation is only
+    # used as a sanity-check veto.  This is the least conservative approach.
+    spatial_corr_floor = 0.5   # ← tune this: reject matches below this correlation
+
+    print(f"  [Centroid-primary] Clustering with centroid p_same only, "
+          f"then vetoing spatial corr < {spatial_corr_floor}...")
+
+    # Step 1: cluster using centroid-only p_same
+    (centroid_primary_map,
+     _cp_centroids,
+     _cp_scores) = cluster_cells_matlab(
+        cell_to_index_map=cell_to_index_map,
+        all_to_all_p_same=p_same_centroid,
+        all_to_all_indexes=data_dist['all_to_all_indexes'],
+        maximal_distance=normalized_maximal_distance,
+        registration_threshold=p_same_threshold,
+        centroid_locations=aligned_centroid_locations,
+        registration_approach=registration_approach,
+        transform_data=False,
+        verbose=False,
+    )
+    n_before_filter = _count_all_sessions(centroid_primary_map, n_sessions)
+
+    # Step 2: post-filter — veto matched pairs with low spatial correlation
+    from cellregpy import compute_spatial_correlation
+    filtered_map = centroid_primary_map.copy()
+    n_vetoed = 0
+    for cluster_idx in range(filtered_map.shape[0]):
+        sess_entries = filtered_map[cluster_idx, :]
+        present_sessions = np.where(sess_entries > 0)[0]
+        if len(present_sessions) < 2:
+            continue
+        # Check all pairwise spatial correlations within this cluster
+        veto = False
+        for ii in range(len(present_sessions)):
+            if veto:
+                break
+            si = present_sessions[ii]
+            ci = int(sess_entries[si]) - 1  # 0-indexed cell index
+            for jj in range(ii + 1, len(present_sessions)):
+                sj = present_sessions[jj]
+                cj = int(sess_entries[sj]) - 1
+                # Compute actual spatial correlation between the two footprints
+                fp_i = aligned_fps[si][ci]
+                fp_j = aligned_fps[sj][cj]
+                sc = compute_spatial_correlation(fp_i, fp_j)
+                if sc < spatial_corr_floor:
+                    veto = True
+                    break
+        if veto:
+            # Remove ALL multi-session links, keep only first present session
+            # (effectively dissolves this cluster into singletons)
+            for s_idx in present_sessions[1:]:
+                filtered_map[cluster_idx, s_idx] = 0
+            n_vetoed += 1
+
+    print(f"  [Centroid-primary] {centroid_primary_map.shape[0]} clusters "
+          f"({n_before_filter} in all sessions before filter)")
+    print(f"  [Centroid-primary] Vetoed {n_vetoed} clusters with spatial corr < {spatial_corr_floor}")
+
+    # --- Count cells in all sessions for each approach ---
+
+    n_all_original  = _count_all_sessions(optimal_cell_to_index_map, n_sessions)
+    n_all_consensus = _count_all_sessions(consensus_map, n_sessions)
+    n_all_combined  = _count_all_sessions(combined_map, n_sessions)
+    n_all_centprim  = _count_all_sessions(filtered_map, n_sessions)
+
+    print(f"\n  --- Cells in ALL {n_sessions} sessions ---")
+    print(f"  Original ({best_model_string}):        {n_all_original}")
+    print(f"  Consensus (both models):               {n_all_consensus}")
+    print(f"  Combined (p_cent × p_spat):            {n_all_combined}")
+    print(f"  Centroid-primary (floor={spatial_corr_floor}): {n_all_centprim}")
+
+    # --- Comparison figure: 4-panel projections ---
+    def _make_projection(fp_list, cmap, session_idx):
+        """Generate RGB projection for one session from a cell_to_index_map."""
+        fps = fp_list[session_idx]
+        if fps.ndim != 3:
+            return np.zeros((100, 100, 3))
+        h, w = fps.shape[1], fps.shape[2]
+        n_sess = cmap.shape[1]
+
+        c_idxs = cmap[:, session_idx].astype(int).copy()
+        absent = c_idxs <= 0
+        c_idxs -= 1
+        c_idxs[absent] = -1
+
+        # Normalize footprints
+        norm = np.zeros_like(fps, dtype=float)
+        for k in range(fps.shape[0]):
+            fp = fps[k].astype(float)
+            mx = float(np.max(fp))
+            if mx > 0:
+                fp[fp < 0.5 * mx] = 0
+                norm[k] = fp / mx
+
+        present_counts = np.sum(cmap > 0, axis=1)
+        idx_all = np.where(present_counts == n_sess)[0]
+        idxs_all = c_idxs[idx_all]; idxs_all = idxs_all[idxs_all >= 0]
+        other_mask = (c_idxs >= 0) & (present_counts < n_sess)
+        idxs_other = c_idxs[other_mask]; idxs_other = idxs_other[idxs_other >= 0]
+
+        img = np.zeros((h, w, 3), dtype=float)
+        s_all = np.sum(norm[idxs_all], axis=0) if len(idxs_all) > 0 else np.zeros((h, w))
+        s_oth = np.sum(norm[idxs_other], axis=0) if len(idxs_other) > 0 else np.zeros((h, w))
+        img[..., 0] = s_oth
+        img[..., 1] = s_oth + s_all
+        img[..., 2] = s_oth
+        return np.clip(img, 0, 1)
+
+    approaches = [
+        (optimal_cell_to_index_map, f"Original\n({best_model_string})\n{n_all_original} in all"),
+        (consensus_map,             f"Consensus\n(both models)\n{n_all_consensus} in all"),
+        (combined_map,              f"Combined p_same\n(centroid × spatial)\n{n_all_combined} in all"),
+        (filtered_map,              f"Centroid-primary\n(spatial floor={spatial_corr_floor})\n{n_all_centprim} in all"),
+    ]
+
+    fig, axes = plt.subplots(len(approaches), n_sessions,
+                             figsize=(4 * n_sessions, 4 * len(approaches)))
+    fig.suptitle('Stage 6 — Dual-Model Comparison', fontsize=16, fontweight='bold', y=0.98)
+
+    for row, (cmap_row, label) in enumerate(approaches):
+        for col in range(n_sessions):
+            ax = axes[row, col] if len(approaches) > 1 else axes[col]
+            proj = _make_projection(aligned_fps, cmap_row, col)
+            ax.imshow(proj)
+            ax.set_xticks([]); ax.set_yticks([])
+            if col == 0:
+                ax.set_ylabel(label, fontsize=11, fontweight='bold')
+            if row == 0:
+                ax.set_title(f'Session {col + 1}', fontsize=13, fontweight='bold')
+
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    savefig_both(fig, os.path.join(fig_dir, "Stage 6 - dual model comparison"), show=SHOW_FIGURES)
+    if not INLINE_PLOTS and not SHOW_FIGURES:
+        plt.close(fig)
+    print("  ✓ Stage 6 comparison figure done")
+
+    # ================================================================== #
     #  Save results (MATLAB lines 662-693)
     # ================================================================== #
     print("\n--- Saving results ---")
     np.save(results_directory / 'cell_to_index_map.npy', optimal_cell_to_index_map)
+    np.save(results_directory / 'cell_to_index_map_consensus.npy', consensus_map)
+    np.save(results_directory / 'cell_to_index_map_combined.npy', combined_map)
+    np.save(results_directory / 'cell_to_index_map_centroid_primary.npy', filtered_map)
     print(f"  Saved: {results_directory / 'cell_to_index_map.npy'}")
+    print(f"  Saved: {results_directory / 'cell_to_index_map_consensus.npy'}")
+    print(f"  Saved: {results_directory / 'cell_to_index_map_combined.npy'}")
+    print(f"  Saved: {results_directory / 'cell_to_index_map_centroid_primary.npy'}")
 
     # ================================================================== #
     #  Summary
@@ -1377,6 +1572,9 @@ def run_pipeline(folder_path: str):
     print(f"  Results saved to: {results_directory}")
     print(f"  Total cells registered: {optimal_cell_to_index_map.shape[0]}")
     print(f"  Best model: {best_model_string}")
+    print(f"  Consensus cells:        {consensus_map.shape[0]}")
+    print(f"  Combined cells:         {combined_map.shape[0]}")
+    print(f"  Centroid-primary cells:  {filtered_map.shape[0]} ({n_all_centprim} in all sessions)")
     print("=" * 60)
 
 

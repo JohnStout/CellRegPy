@@ -3070,7 +3070,8 @@ def initial_registration_spatial_corr(spatial_footprints: List[np.ndarray],
         
         # Find candidates for each new cell
         best_corr = np.zeros(n_new)
-        best_reg_idx = np.zeros(n_new, dtype=int)
+        #best_reg_idx = np.zeros(n_new, dtype=int)
+        best_reg_idx = -np.ones(n_new, dtype=int)
         
         for k in range(n_new):
             # Find registered cells within distance
@@ -3299,7 +3300,7 @@ def compute_spatial_correlations_model(neighbors_spatial_correlations: np.ndarra
     hi = data[corr >= 0.7]
     if hi.size >= 5:
         mu = float(np.mean(np.log(hi)))
-        sigma = float(max(np.std(np.log(hi), ddof=0), 1e-6))
+        sigma = float(max(np.std(np.log(hi), ddof=1), 1e-6))
     else:
         mu, sigma = -4.0, 0.5
 
@@ -4063,7 +4064,153 @@ def cluster_cells_matlab(cell_to_index_map: np.ndarray,
     return cmap, clusters_centroids, cluster_scores
 
 
-# -- OLD -- #
+def combine_p_same(p_same_a, p_same_b):
+    """
+    Combine two p_same structures by element-wise multiplication.
+
+    Each p_same is a nested list:
+        p_same[sess_i][cell_j][sess_k] = 1-D array of p_same values
+
+    Returns a new structure with the same shape where each element is
+    p_same_a * p_same_b.  Entries that exist in only one input are set
+    to the value from that input (graceful fallback).
+    """
+    n_sessions = len(p_same_a)
+    combined = []
+    for si in range(n_sessions):
+        sess_list = []
+        for ci in range(len(p_same_a[si])):
+            cell_dict = {}
+            for sk in range(n_sessions):
+                pa = p_same_a[si][ci].get(sk) if isinstance(p_same_a[si][ci], dict) else (
+                    p_same_a[si][ci][sk] if sk < len(p_same_a[si][ci]) else None)
+                pb = p_same_b[si][ci].get(sk) if isinstance(p_same_b[si][ci], dict) else (
+                    p_same_b[si][ci][sk] if sk < len(p_same_b[si][ci]) else None)
+
+                if pa is None and pb is None:
+                    val = None
+                elif pa is None:
+                    val = pb
+                elif pb is None:
+                    val = pa
+                else:
+                    a_arr = np.asarray(pa, dtype=np.float64)
+                    b_arr = np.asarray(pb, dtype=np.float64)
+                    # Arrays must match in length;
+                    # if not, take element-wise min length
+                    n = min(len(a_arr), len(b_arr))
+                    val = a_arr[:n] * b_arr[:n]
+
+                cell_dict[sk] = val
+            sess_list.append(cell_dict)
+        combined.append(sess_list)
+    return combined
+
+
+def cluster_cells_consensus(cell_to_index_map,
+                            p_same_centroid,
+                            p_same_spatial,
+                            all_to_all_indexes,
+                            maximal_distance,
+                            registration_threshold,
+                            centroid_locations,
+                            registration_approach='Probabilistic',
+                            transform_data=False,
+                            verbose=True):
+    """
+    Consensus clustering: run cluster_cells_matlab independently with
+    centroid p_same and spatial p_same, then keep only cells that appear
+    in BOTH cluster maps.
+
+    Returns:
+        consensus_map : np.ndarray, shape (n_consensus, n_sessions)
+            Cell-to-index map containing only consensus clusters.
+        map_centroid  : np.ndarray  – full centroid-only cluster map
+        map_spatial   : np.ndarray  – full spatial-only cluster map
+        n_centroid    : int – total clusters from centroid model
+        n_spatial     : int – total clusters from spatial model
+    """
+    if verbose:
+        print("  [Consensus] Running centroid-model clustering...")
+    map_c, _, _ = cluster_cells_matlab(
+        cell_to_index_map=cell_to_index_map,
+        all_to_all_p_same=p_same_centroid,
+        all_to_all_indexes=all_to_all_indexes,
+        maximal_distance=maximal_distance,
+        registration_threshold=registration_threshold,
+        centroid_locations=centroid_locations,
+        registration_approach=registration_approach,
+        transform_data=transform_data,
+        verbose=False,
+    )
+
+    if verbose:
+        print("  [Consensus] Running spatial-model clustering...")
+    map_s, _, _ = cluster_cells_matlab(
+        cell_to_index_map=cell_to_index_map,
+        all_to_all_p_same=p_same_spatial,
+        all_to_all_indexes=all_to_all_indexes,
+        maximal_distance=maximal_distance,
+        registration_threshold=registration_threshold,
+        centroid_locations=centroid_locations,
+        registration_approach=registration_approach,
+        transform_data=transform_data,
+        verbose=False,
+    )
+
+    n_sessions = map_c.shape[1]
+
+    # Build lookup: (session, cell_1based) -> cluster_row for each map
+    def _build_lookup(cmap):
+        lookup = {}
+        for row in range(cmap.shape[0]):
+            for s in range(cmap.shape[1]):
+                idx = int(cmap[row, s])
+                if idx > 0:
+                    lookup[(s, idx)] = row
+        return lookup
+
+    lookup_c = _build_lookup(map_c)
+    lookup_s = _build_lookup(map_s)
+
+    # For each cluster in map_c, check if the SAME cells also form a
+    # cluster in map_s (i.e., all present cells map to the same row in map_s)
+    consensus_rows = []
+    for row_c in range(map_c.shape[0]):
+        cells_c = map_c[row_c, :]
+        present = np.where(cells_c > 0)[0]
+        if len(present) < 2:
+            continue  # single-session cluster, skip
+
+        # Find what rows these cells map to in map_s
+        s_rows = set()
+        all_found = True
+        for s in present:
+            key = (s, int(cells_c[s]))
+            if key in lookup_s:
+                s_rows.add(lookup_s[key])
+            else:
+                all_found = False
+                break
+
+        # Consensus: all cells in this centroid cluster must belong
+        # to the SAME cluster in the spatial map
+        if all_found and len(s_rows) == 1:
+            consensus_rows.append(row_c)
+
+    if len(consensus_rows) > 0:
+        consensus_map = map_c[consensus_rows, :]
+    else:
+        consensus_map = np.zeros((0, n_sessions), dtype=int)
+
+    if verbose:
+        print(f"  [Consensus] Centroid clusters: {map_c.shape[0]}, "
+              f"Spatial clusters: {map_s.shape[0]}, "
+              f"Consensus: {consensus_map.shape[0]}")
+
+    return consensus_map, map_c, map_s, map_c.shape[0], map_s.shape[0]
+
+
 def cluster_cells(cell_to_index_map: np.ndarray,
                   all_to_all_p_same: List,
                   all_to_all_indexes: List,
