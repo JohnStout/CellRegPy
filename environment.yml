@@ -1,0 +1,21 @@
+name: cellregpy
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # Core conda-managed packages
+  - python=3.9
+  - numpy
+  - scipy
+  - scikit-image
+  - matplotlib
+  - pandas
+  - ipykernel
+  - jupyter
+
+  # Ensure pip is available
+  - pip
+
+  # Install the local package in editable mode via pip
+  - pip:
+    - -e .
