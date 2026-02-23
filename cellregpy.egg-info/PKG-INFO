@@ -1,0 +1,126 @@
+Metadata-Version: 2.4
+Name: cellregpy
+Version: 0.1.0
+Summary: Cross-session cell registration for calcium imaging – a Python port of CellReg.
+Author: John Stout
+License: MIT
+Project-URL: Homepage, https://github.com/JohnStout/CellRegPy
+Project-URL: Repository, https://github.com/JohnStout/CellRegPy
+Project-URL: Issues, https://github.com/JohnStout/CellRegPy/issues
+Keywords: neuroscience,calcium-imaging,cell-registration,suite2p,cellreg
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Topic :: Scientific/Engineering :: Bio-Informatics
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy>=1.22
+Requires-Dist: scipy>=1.8
+Requires-Dist: scikit-image>=0.19
+Requires-Dist: matplotlib>=3.5
+Requires-Dist: pandas>=1.4
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: jupyter>=1.0; extra == "dev"
+Requires-Dist: notebook>=6.0; extra == "dev"
+Dynamic: license-file
+
+# CellRegPy
+
+**Cross-session cell registration for calcium imaging in Python.**
+
+A Python port of the MATLAB [CellReg](https://github.com/zivlab/CellReg)/batchRunCellReg pipeline with key improvements:
+
+- **Mean image alignment** — multi-transform search with high-pass filtering (innovation over standard CellReg)
+- **Probabilistic cell matching** — based on spatial footprints and centroid distances
+- **Automatic session detection** — finds suite2p `plane0` folders from a mouse directory
+- **MATLAB-matching figures** — reproduces all CellReg diagnostic figures
+
+## Installation
+
+### Option 1: Conda environment (recommended)
+
+This creates a self-contained `cellregpy` environment with all dependencies:
+
+```bash
+git clone https://github.com/JohnStout/CellRegPy.git
+cd CellRegPy
+conda env create -f environment.yml
+conda activate cellregpy
+```
+
+### Option 2: pip install from source
+
+```bash
+git clone https://github.com/JohnStout/CellRegPy.git
+cd CellRegPy
+pip install -e .
+```
+
+### Option 3: pip install from PyPI
+
+```bash
+pip install cellregpy
+```
+
+## Quick Start
+
+```python
+from cellregpy import CellRegConfig, list_session_folders, get_spatial_footprints, MeanImageAligner
+
+# Point to your mouse data folder
+mouse_folder = r"path/to/mouse/data"
+
+# Find all sessions
+sessions = list_session_folders(mouse_folder)
+print(f"Found {len(sessions)} sessions")
+
+# Load spatial footprints
+footprints = [get_spatial_footprints(s / "CellReg.mat") for s in sessions]
+
+# Align sessions using mean images
+aligner = MeanImageAligner(CellRegConfig(microns_per_pixel=2.0))
+```
+
+See [`notebooks/demo_validate_alignment.ipynb`](notebooks/demo_validate_alignment.ipynb) for a full end-to-end example.
+
+## Package Structure
+
+```
+CellRegPy/
+├── cellregpy/
+│   ├── __init__.py              # Public API
+│   ├── cellregpy.py             # Core registration engine
+│   └── plotting.py              # MATLAB-matching figure generation
+├── notebooks/
+│   └── demo_validate_alignment.ipynb   # End-to-end demo notebook
+├── pyproject.toml
+├── LICENSE
+└── README.md
+```
+
+## Dependencies
+
+- NumPy ≥ 1.22
+- SciPy ≥ 1.8
+- scikit-image ≥ 0.19
+- Matplotlib ≥ 3.5
+- pandas ≥ 1.4
+
+## Citation
+
+If you use CellRegPy in your research, please cite:
+
+> Sheintuch, L., Rubin, A., Brande-Eilat, N., Geva, N., Sadeh, N., Pinchasof, O., Ziv, Y. (2017). Tracking the Same Neurons across Multiple Days in Ca2+ Imaging Data. Cell Reports, 21(4), pp. 1102–1115. doi: 10.1016/j.celrep.2017.10.013.
+> Stout, J. and Spellman, T. (2026). CellRegPy: Cross-session cell registration for calcium imaging, a Python implementation. GitHub. https://github.com/JohnStout/CellRegPy
+
+## License
+
+MIT License — see [LICENSE](LICENSE) for details.

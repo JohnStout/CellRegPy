@@ -2941,18 +2941,22 @@ def compute_data_distribution(spatial_footprints: List[np.ndarray],
                 
                 for idx in nearby_idx:
                     other_fp = other_fps[idx]
-                    
+
+                    # compute correlation (keep invalid as 0.0, like your current behavior)
                     if this_fp.sum() == 0 or other_fp.sum() == 0:
-                        corr_vec.append(0.0)
+                        r = 0.0
                     else:
                         r = compute_spatial_correlation(this_fp, other_fp)
-                        corr_vec.append(r)
-                        
-                        # Store for global distributions
-                        neighbors_corrs.append(r)
-                        neighbors_dists.append(distances[idx])
-                        neighbors_x_disp.append(centroid[0] - other_cents[idx, 0])
-                        neighbors_y_disp.append(centroid[1] - other_cents[idx, 1])
+                        if not np.isfinite(r):
+                            r = 0.0
+
+                    corr_vec.append(float(r))
+
+                    # ALWAYS store into the global neighbor distributions
+                    neighbors_corrs.append(float(r))
+                    neighbors_dists.append(float(distances[idx]))
+                    neighbors_x_disp.append(float(centroid[0] - other_cents[idx, 0]))
+                    neighbors_y_disp.append(float(centroid[1] - other_cents[idx, 1]))
                 
                 corr_vec = np.array(corr_vec)
                 nearby_dists = distances[nearby_idx]
@@ -3449,6 +3453,7 @@ def compute_centroid_distances_model_custom(neighbors_centroid_distances: np.nda
     """
     from scipy.stats import lognorm as _lognorm
     from scipy.optimize import curve_fit as _curve_fit
+    from scipy.special import expit
 
     d = np.asarray(neighbors_centroid_distances, dtype=np.float64)
     d = d[np.isfinite(d)]
@@ -3508,33 +3513,38 @@ def compute_centroid_distances_model_custom(neighbors_centroid_distances: np.nda
         sg_ = max(sg_, 1e-6)
         same = (1.0 / (xd * sg_ * np.sqrt(2 * np.pi))) * np.exp(
             -(np.log(xd) - mu_) ** 2 / (2 * sg_ ** 2))
-        diff = b_ * xd / (1.0 + np.exp(-a_ * (xd - c_)))
+        #diff = b_ * xd / (1.0 + np.exp(-a_ * (xd - c_)))
+        diff = b_ * xd * expit(a_ * (xd - c_))
+        #diff_raw = b * xdata * expit(a * (xdata - c))
+
         return p_ * same + (1 - p_) * diff
 
     # ---- joint fit (MATLAB lsqcurvefit with Levenberg-Marquardt) ----
     # MATLAB uses 'levenberg-marquardt' which ignores bounds.
     # Use scipy curve_fit with method='lm' (no bounds) to match.
-    try:
-        popt, _ = _curve_fit(_mixture, xdata, distribution, p0=x0_vec,
-                             method='lm', maxfev=20000)
-        p, mu, sg, a, c, b = popt
-    except Exception:
-        # Fallback to TRF with bounds if LM fails
-        from scipy.optimize import least_squares as _ls
-        lb = np.array([0.0, -np.inf, 1e-6, 0.0, 0.0, 0.0])
-        ub = np.array([1.0,  np.inf, 10.0, 1e3, np.max(xdata) * 10, np.inf])
-        def _resid(par):
-            return _mixture(xdata, *par) - distribution
-        res = _ls(_resid, x0_vec, bounds=(lb, ub), method='trf',
-                  max_nfev=20000, ftol=1e-8, xtol=1e-8)
-        p, mu, sg, a, c, b = res.x
+    # ---- joint fit (use bounded solver to avoid insane params / exp overflow) ----
+    lb = np.array([0.0, -np.inf, 1e-6, 0.0, 0.0, 0.0])
+    ub = np.array([1.0,  np.inf, 10.0, 1e3, np.max(xdata) * 10, np.inf])
+
+    popt, _ = _curve_fit(
+        _mixture,
+        xdata,
+        distribution,
+        p0=x0_vec,
+        bounds=(lb, ub),      # <-- this is the key change
+        method='trf',         # <-- this replaces method='lm'
+        maxfev=20000
+    )
+    p, mu, sg, a, c, b = popt
+
     # Clamp p to [0,1] and sg > 0 since LM doesn't enforce bounds
     p = float(np.clip(p, 0.0, 1.0))
     sg = max(sg, 1e-6)
 
     # ---- component PDFs (individually normalized like MATLAB lines 79-87) ----
     same_raw = _lognorm.pdf(xdata, s=sg, scale=np.exp(mu))
-    diff_raw = b * xdata / (1.0 + np.exp(-a * (xdata - c)))
+    #diff_raw = b * xdata / (1.0 + np.exp(-a * (xdata - c)))
+    diff_raw = b * xdata * expit(a * (xdata - c))
 
     def _norm_pdf(pdf):
         s = pdf.sum()
