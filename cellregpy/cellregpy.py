@@ -1765,7 +1765,7 @@ class CellRegPy:
                     cents = centroid_locations[i]
                     if len(cents) > 0:
                         # NEW (correct for affine + projective)
-                        aligned_centroid_locations[i] = tform(cents_xy)  # expects Nx2 (x,y)
+                        aligned_centroid_locations[i] = tform(cents)  # expects Nx2 (x,y)
                     else:
                         aligned_centroid_locations[i] = cents
                 else:
