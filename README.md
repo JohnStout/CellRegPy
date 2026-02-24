@@ -1,8 +1,8 @@
 # CellRegPy
 
-**Cross-session cell registration for calcium imaging in Python.**
+**Cross-session cell registration for calcium imaging in Python. Works with Suite2P!**
 
-A Python port of the MATLAB [CellReg](https://github.com/zivlab/CellReg)/batchRunCellReg pipeline with key improvements:
+A Python port of the MATLAB [CellReg](https://github.com/zivlab/CellReg) with key improvements meant to fit with Suite2P results:
 
 - **Mean image alignment** — multi-transform search with high-pass filtering (innovation over standard CellReg)
 - **Probabilistic cell matching** — based on spatial footprints and centroid distances
