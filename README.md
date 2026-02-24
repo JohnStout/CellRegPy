@@ -82,10 +82,9 @@ CellRegPy/
 
 ## Citation
 
-If you use CellRegPy in your research, please cite:
+If you use CellRegPy in your research, please cite the original CellReg research article:
 
 > Sheintuch, L., Rubin, A., Brande-Eilat, N., Geva, N., Sadeh, N., Pinchasof, O., Ziv, Y. (2017). Tracking the Same Neurons across Multiple Days in Ca2+ Imaging Data. Cell Reports, 21(4), pp. 1102–1115. doi: 10.1016/j.celrep.2017.10.013.
-> Stout, J. and Spellman, T. (2026). CellRegPy: Cross-session cell registration for calcium imaging, a Python implementation. GitHub. https://github.com/JohnStout/CellRegPy
 
 ## License
 
