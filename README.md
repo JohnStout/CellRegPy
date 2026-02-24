@@ -6,7 +6,7 @@ A Python port of the MATLAB [CellReg](https://github.com/zivlab/CellReg) with ke
 
 - **Mean image alignment** — multi-transform search with high-pass filtering (innovation over standard CellReg)
 - **Probabilistic cell matching** — based on spatial footprints and centroid distances
-- **Automatic session detection** — finds suite2p `plane0` folders from a mouse directory
+- **Automatic session detection** — finds suite2p `plane0` folders from a mouse directory - Currently only supports single plane imaging
 - **MATLAB-matching figures** — reproduces all CellReg diagnostic figures
 
 ## Installation
