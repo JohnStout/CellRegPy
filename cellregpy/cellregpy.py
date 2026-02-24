@@ -80,6 +80,17 @@ class CellRegConfig:
     # Probabilistic model selection
     # Options: 'Spatial correlation' or 'Centroid distance'
     model_type: str = "auto"
+
+    # Dual-model final registration (Stage 6 style):
+    #   centroid p_same drives clustering, then spatial correlation is used as a veto/floor.
+    dual_model: bool = False
+    apply_spatial_floor_filter: bool = False   # alias; if True, dual_model behavior is enabled
+    spatial_corr_floor: float = 0.5
+
+    # Figure saving (per FOV) — mirrors validate_alignment_script outputs
+    save_figures: bool = False
+    also_pdf: bool = False
+    close_figures: bool = True
     # Mean image alignment parameters (from mean_img_alignment.m)
     blur_hp: float = 12.0  # sigma for highpass background estimate
     blur_lp: float = 5.0   # sigma for lowpass scoring
@@ -1678,6 +1689,10 @@ class CellRegPy:
             results_dir: Directory to save results
         """
         cfg = self.config
+
+        # Dual-model settings (Stage 6 style): centroid-primary + spatial-correlation floor veto
+        use_dual_model = bool(getattr(cfg, 'dual_model', False) or getattr(cfg, 'apply_spatial_floor_filter', False))
+        spatial_corr_floor = float(getattr(cfg, 'spatial_corr_floor', 0.5))
         n_sessions = len(sessions)
         print(f"  Registering {n_sessions} sessions...")
         
@@ -1827,25 +1842,32 @@ class CellRegPy:
             
             raw_model_type = str(cfg.model_type).strip()
 
-            if raw_model_type.lower() in ("auto", "best", "matlab"):
-                model_used = choose_best_model(
+            # Always compute best_model_string for reporting, but optionally override
+            # the *final* registration to use the dual-model approach (Stage 6).
+
+            if raw_model_type.lower() in ('auto', 'best', 'matlab'):
+                best_model_string = choose_best_model(
                     centroid_overlap_mse,
                     corr_overlap_mse,
                     centroid_intersection=centroid_intersection,
                     corr_intersection=corr_intersection,
-                    prefer="Spatial correlation",
+                    prefer='Spatial correlation',
                 )
             else:
-                if raw_model_type.lower().startswith("centroid"):
-                    model_used = "Centroid distance"
-                elif raw_model_type.lower().startswith("spatial") or raw_model_type.lower().startswith("corr"):
-                    model_used = "Spatial correlation"
+                if raw_model_type.lower().startswith('centroid'):
+                    best_model_string = 'Centroid distance'
+                elif raw_model_type.lower().startswith('spatial') or raw_model_type.lower().startswith('corr'):
+                    best_model_string = 'Spatial correlation'
                 else:
                     raise ValueError(f"Unknown model_type: {cfg.model_type!r}. Use 'auto', 'Spatial correlation', or 'Centroid distance'.")
 
-            if model_used == "Centroid distance":
+            # Dual-model override: force centroid-primary clustering, then apply spatial floor veto
+            model_used = 'Centroid distance' if use_dual_model else best_model_string
+
+            if model_used == 'Centroid distance':
                 all_to_all_p_same = p_same_centroid_distances
-                initial_metric_threshold = centroid_intersection if np.isfinite(centroid_intersection) else max_dist_px
+                # NOTE: centroid_intersection is in µm; initial registration expects pixels
+                initial_metric_threshold = (float(centroid_intersection) / float(cfg.microns_per_pixel)) if np.isfinite(centroid_intersection) else max_dist_px
             else:
                 all_to_all_p_same = p_same_spatial_correlations
                 initial_metric_threshold = corr_intersection if np.isfinite(corr_intersection) else cfg.sufficient_correlation_footprints
@@ -1878,8 +1900,9 @@ class CellRegPy:
             non_registered_distances = np.array([])
 
         # Step 5: Cluster / refine mapping (MATLAB Stage 5)
-        # MATLAB calls cluster_cells for BOTH model types (not just spatial correlation)
-        optimal_cell_to_index_map, registered_cells_centroids, cluster_scores = cluster_cells_matlab(
+        # We always cluster using the selected model_used. For the dual-model approach,
+        # model_used is forced to 'Centroid distance' (centroid-primary).
+        centroid_primary_map, registered_cells_centroids, cluster_scores = cluster_cells_matlab(
             cell_to_index_map,
             all_to_all_p_same,
             data_dist["all_to_all_indexes"],
@@ -1891,19 +1914,79 @@ class CellRegPy:
             verbose=True
         )
 
-        # Accuracy estimate (probabilistic)
+        # Step 6 (dual-model): spatial floor veto (centroid-primary + spatial-corr cutoff)
+        pre_spatial_floor_map = centroid_primary_map.copy()
+        n_vetoed_clusters = 0
+        vetoed_centroid_um = []
+        vetoed_spatial_corr = []
+
+        if use_dual_model:
+            filtered_map = pre_spatial_floor_map.copy()
+            for cluster_idx in range(filtered_map.shape[0]):
+                row = filtered_map[cluster_idx, :]
+                present_sessions = np.where(row > 0)[0]
+                if present_sessions.size < 2:
+                    continue
+                veto = False
+                # check all within-cluster session pairs
+                for ii in range(present_sessions.size):
+                    if veto: break
+                    si = int(present_sessions[ii])
+                    ci = int(row[si]) - 1
+                    for jj in range(ii + 1, present_sessions.size):
+                        sj = int(present_sessions[jj])
+                        cj = int(row[sj]) - 1
+                        fp_i = aligned_fps[si][ci]
+                        fp_j = aligned_fps[sj][cj]
+                        sc = compute_spatial_correlation(fp_i, fp_j)
+                        if sc < spatial_corr_floor:
+                            # record the failing pair for histograms
+                            di = aligned_centroid_locations[si][ci]
+                            dj = aligned_centroid_locations[sj][cj]
+                            dpx = float(np.sqrt(np.sum((di - dj) ** 2)))
+                            vetoed_centroid_um.append(dpx * float(cfg.microns_per_pixel))
+                            vetoed_spatial_corr.append(float(sc))
+                            veto = True
+                            break
+                if veto:
+                    # dissolve this multi-session cluster into singletons (keep first session only)
+                    for s_idx in present_sessions[1:]:
+                        filtered_map[cluster_idx, int(s_idx)] = 0
+                    n_vetoed_clusters += 1
+
+            cell_to_index_map = filtered_map
+        else:
+            cell_to_index_map = centroid_primary_map
+
+        # Recompute probabilistic accuracy on FINAL map (post-veto if dual_model enabled)
         p_same_vec, p_different_vec, accuracy_scores = estimate_registration_accuracy(
-            optimal_cell_to_index_map,
+            cell_to_index_map,
             all_to_all_p_same,
             data_dist["all_to_all_indexes"],
             threshold=cfg.p_same_threshold,
         )
 
-        # Replace initial map with optimized map for downstream outputs
-        cell_to_index_map = optimal_cell_to_index_map
+        # Recompute cluster score distributions on FINAL map (so any downstream plots match the dual output)
+        try:
+            scores_out = compute_scores_matlab(
+                cell_to_index_map, data_dist["all_to_all_indexes"], all_to_all_p_same, n_sessions
+            )
+            cluster_scores = dict(
+                cell_scores=scores_out[0],
+                cell_scores_positive=scores_out[1],
+                cell_scores_negative=scores_out[2],
+                cell_scores_exclusive=scores_out[3],
+                p_same_registered_pairs=scores_out[4],
+            )
+        except Exception:
+            pass
 
         p_same_models = dict(
             model_used=model_used,
+            best_model_string=best_model_string if 'best_model_string' in locals() else model_used,
+            dual_model=use_dual_model,
+            spatial_corr_floor=spatial_corr_floor,
+            n_vetoed_clusters=int(n_vetoed_clusters) if 'n_vetoed_clusters' in locals() else 0,
             number_of_bins=number_of_bins,
             centers_of_bins=centers_of_bins,
             p_same_threshold=cfg.p_same_threshold,
@@ -1936,6 +2019,12 @@ class CellRegPy:
         
         results = {
             'cell_to_index_map': cell_to_index_map,
+            'cell_to_index_map_pre_spatial_floor': pre_spatial_floor_map if 'pre_spatial_floor_map' in locals() else None,
+            'dual_model_enabled': bool(use_dual_model),
+            'spatial_corr_floor': float(spatial_corr_floor),
+            'n_vetoed_clusters': int(n_vetoed_clusters) if 'n_vetoed_clusters' in locals() else 0,
+            'vetoed_centroid_um': np.asarray(vetoed_centroid_um, dtype=float) if 'vetoed_centroid_um' in locals() else np.array([]),
+            'vetoed_spatial_corr': np.asarray(vetoed_spatial_corr, dtype=float) if 'vetoed_spatial_corr' in locals() else np.array([]),
             'spatial_correlation_map': spatial_correlation_map,
             'registered_cells_correlations': registered_correlations,
             'non_registered_cells_correlations': non_registered_correlations,
@@ -1963,6 +2052,11 @@ class CellRegPy:
         
         # Save as .npy
         np.save(results_dir / 'cell_to_index_map.npy', cell_to_index_map)
+        if use_dual_model and 'pre_spatial_floor_map' in locals():
+            try:
+                np.save(results_dir / 'cell_to_index_map_pre_spatial_floor.npy', pre_spatial_floor_map)
+            except Exception:
+                pass
         np.save(results_dir / 'spatial_correlation_map.npy', spatial_correlation_map)
         np.save(results_dir / 'registration_results.npy', results)
         
@@ -1973,6 +2067,163 @@ class CellRegPy:
         except Exception as e:
             warnings.warn(f"Could not save .mat file: {e}")
         
+        # ------------------------------------------------------------------
+        # FIGURES (saved per-FOV; mirrors demo_validate_alignment / validation)
+        # For the dual-model workflow we intentionally OMIT 'Stage 4' and 'Stage 5'
+        # plots, and instead save a 'Stage 6 (dual)' summary including:
+        #   - centroid distance histogram (accepted vs vetoed)
+        #   - spatial correlation histogram (accepted vs vetoed, floor shown)
+        #   - final registered projections + pairwise overlap
+        # ------------------------------------------------------------------
+        if bool(getattr(cfg, 'save_figures', False)):
+            try:
+                import os
+                import matplotlib.pyplot as plt
+                from plotting import (
+                    plot_session_projections,
+                    validate_alignment_deck,
+                    plot_x_y_displacements,
+                    plot_models,
+                    plot_all_registered_projections,
+                    plot_pairwise_session_overlap,
+                    savefig_both,
+                    _extract_p_from_model_string,
+                    _compute_histogram_distribution,
+                )
+
+                fig_dir = results_dir.parent / 'Figures'
+                fig_dir.mkdir(parents=True, exist_ok=True)
+                fig_dir_s = str(fig_dir)
+
+                show_figs = str(getattr(cfg, 'figures_visibility', 'off')).strip().lower() == 'on'
+                also_pdf = bool(getattr(cfg, 'also_pdf', False))
+                close_figs = bool(getattr(cfg, 'close_figures', True))
+
+                # Stage 1 — session projections (raw, adjusted footprints)
+                plot_session_projections(footprint_projections, fig_dir_s, show=show_figs, also_pdf=also_pdf)
+
+                # Stage 2 — alignment deck (uses aligned projections so we don't depend on dx/dy bookkeeping)
+                aligned_proj = compute_footprint_projections(aligned_fps)
+                validate_alignment_deck(
+                    mean_images=fov_mean_images,
+                    footprints_proj_raw=footprint_projections,
+                    footprints_proj_aligned=aligned_proj,
+                    reference_session_index=ref_idx,
+                    alignment_translations=None,
+                    scores=None,
+                    out_dir=fig_dir_s,
+                    session_names=[Path(s).parents[2].name if isinstance(s, (str, Path)) else str(s) for s in sessions],
+                    show=show_figs,
+                    also_pdf=also_pdf,
+                )
+
+                # Stage 3 — displacement + mixture models
+                plot_x_y_displacements(
+                    data_dist['neighbors_x_displacements'],
+                    data_dist['neighbors_y_displacements'],
+                    cfg.microns_per_pixel,
+                    max_dist_px,
+                    number_of_bins,
+                    centers_of_bins,
+                    fig_dir_s,
+                    show=show_figs,
+                    also_pdf=also_pdf,
+                )
+
+                p_centroid = _extract_p_from_model_string(centroid_best_model)
+                p_spatial = _extract_p_from_model_string(corr_best_model)
+                centroid_dist_distribution = _compute_histogram_distribution(
+                    data_dist['neighbors_centroid_distances'], centers_of_bins[0], number_of_bins, scale=cfg.microns_per_pixel
+                )
+                spatial_corr_distribution = _compute_histogram_distribution(
+                    np.asarray(data_dist['neighbors_spatial_correlations']).ravel()[np.asarray(data_dist['neighbors_spatial_correlations']).ravel() >= 0],
+                    centers_of_bins[1], number_of_bins, scale=1.0
+                )
+
+                plot_models(
+                    np.array([p_centroid]),
+                    data_dist['NN_centroid_distances'],
+                    data_dist['NNN_centroid_distances'],
+                    centroid_dist_distribution,
+                    centroid_same_model,
+                    centroid_diff_model,
+                    centroid_mixture_model,
+                    centroid_intersection,
+                    centers_of_bins[0],
+                    spatial_correlations_model_parameters=np.array([p_spatial]),
+                    NN_spatial_correlations=data_dist['NN_spatial_correlations'],
+                    NNN_spatial_correlations=data_dist['NNN_spatial_correlations'],
+                    spatial_correlations_distribution=spatial_corr_distribution,
+                    spatial_correlations_model_same_cells=corr_same_model,
+                    spatial_correlations_model_different_cells=corr_diff_model,
+                    spatial_correlations_model_weighted_sum=corr_mixture_model,
+                    spatial_correlation_intersection=corr_intersection,
+                    centers_of_bins_corr=centers_of_bins[1],
+                    microns_per_pixel=cfg.microns_per_pixel,
+                    maximal_distance=max_dist_px,
+                    out_dir=fig_dir_s,
+                    show=show_figs,
+                    also_pdf=also_pdf,
+                )
+
+                # Stage 6 (dual) — compute accepted pair metrics from FINAL map
+                accepted_centroid_um = []
+                accepted_spatial_corr = []
+                try:
+                    for cluster_idx in range(cell_to_index_map.shape[0]):
+                        row = cell_to_index_map[cluster_idx, :]
+                        present_sessions = np.where(row > 0)[0]
+                        if present_sessions.size < 2:
+                            continue
+                        for ii in range(present_sessions.size):
+                            si = int(present_sessions[ii])
+                            ci = int(row[si]) - 1
+                            for jj in range(ii + 1, present_sessions.size):
+                                sj = int(present_sessions[jj])
+                                cj = int(row[sj]) - 1
+                                fp_i = aligned_fps[si][ci]
+                                fp_j = aligned_fps[sj][cj]
+                                sc = compute_spatial_correlation(fp_i, fp_j)
+                                di = aligned_centroid_locations[si][ci]
+                                dj = aligned_centroid_locations[sj][cj]
+                                dpx = float(np.sqrt(np.sum((di - dj) ** 2)))
+                                accepted_centroid_um.append(dpx * float(cfg.microns_per_pixel))
+                                accepted_spatial_corr.append(float(sc))
+                except Exception:
+                    pass
+
+                # Stage 6 histograms (centroid + spatial) — replaces Stage 4/5 plots
+                fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+                # centroid distances
+                bins_d = np.linspace(0, float(cfg.maximal_distance), max(20, int(number_of_bins)))
+                axes[0].hist(accepted_centroid_um, bins=bins_d, alpha=0.7, label='Accepted')
+                axes[0].hist(vetoed_centroid_um, bins=bins_d, alpha=0.7, label='Vetoed')
+                axes[0].set_xlabel('Centroid distance (µm)')
+                axes[0].set_ylabel('Count')
+                axes[0].legend(frameon=False)
+                # spatial correlations
+                bins_c = np.linspace(0, 1, max(20, int(number_of_bins)))
+                axes[1].hist(accepted_spatial_corr, bins=bins_c, alpha=0.7, label='Accepted')
+                axes[1].hist(vetoed_spatial_corr, bins=bins_c, alpha=0.7, label='Vetoed')
+                axes[1].axvline(float(spatial_corr_floor), linestyle='--', linewidth=2)
+                axes[1].set_xlabel('Spatial correlation')
+                axes[1].set_ylabel('Count')
+                axes[1].legend(frameon=False)
+                fig.suptitle(f'Stage 6 (Dual) — centroid-primary + spatial floor={float(spatial_corr_floor):.2f}', fontweight='bold')
+                fig.tight_layout(rect=[0, 0, 1, 0.93])
+                savefig_both(fig, os.path.join(fig_dir_s, 'Stage 6 - dual histograms'), also_pdf=also_pdf, show=show_figs)
+                if close_figs and (not show_figs):
+                    plt.close(fig)
+
+                # Stage 6 projections + overlap (final map only)
+                plot_all_registered_projections(aligned_fps, cell_to_index_map, fig_dir_s, show=show_figs, also_pdf=also_pdf, stage_label='Stage 6 (dual)')
+                plot_pairwise_session_overlap(aligned_fps, cell_to_index_map, fig_dir_s, show=show_figs)
+
+                if close_figs and (not show_figs):
+                    plt.close('all')
+
+            except Exception as e:
+                warnings.warn(f'Figure generation failed: {e}')
         print(f"  ✓ Registered {cell_to_index_map.shape[0]} cell clusters across {n_sessions} sessions")
     
     def _get_sessions_from_folder(self, mouse_folder: Path) -> List[Path]:
@@ -4348,10 +4599,72 @@ def cluster_cells(cell_to_index_map: np.ndarray,
 # ============================================================================ #
 
 
+
+# ============================================================================ #
+#                             CONVENIENCE API                                  #
+# ============================================================================ #
+
+def run_pipeline(folder_path: Union[str, Path],
+                 cfg: Optional[CellRegConfig] = None,
+                 *,
+                 spatial_corr_floor: float = 0.5,
+                 save_figures: bool = True,
+                 figures_visibility: str = 'off',
+                 export_csv: bool = True) -> Tuple[pd.DataFrame, Dict]:
+    """One-call entrypoint: run the full CellRegPy pipeline on a mouse folder.
+
+    This enforces the Stage-6 dual-model approach:
+        1) centroid-distance probabilistic model drives clustering
+        2) spatial correlation is used ONLY as a post-hoc veto (floor cutoff)
+
+    Args:
+        folder_path: Mouse folder containing session subfolders.
+        cfg: Optional CellRegConfig. If None, defaults are used.
+        spatial_corr_floor: Spatial correlation veto threshold (default 0.5).
+        save_figures: Save per-FOV figures into 1_CellReg/FOV*/Figures (default True).
+        figures_visibility: 'on' to display; 'off' to save+close (default 'off').
+        export_csv: Save mouse_table.csv and mouse_table_wide.csv into 1_CellReg (default True).
+
+    Returns:
+        (mouse_table, mouse_data)
+    """
+    mouse_folder = Path(folder_path)
+    cfg = cfg or CellRegConfig()
+
+    # Enforce dual-model final registration
+    cfg.model_type = 'Centroid distance'
+    cfg.dual_model = True
+    cfg.apply_spatial_floor_filter = True
+    cfg.spatial_corr_floor = float(spatial_corr_floor)
+
+    # Figures
+    cfg.save_figures = bool(save_figures)
+    cfg.figures_visibility = str(figures_visibility)
+    cfg.close_figures = True
+
+    cellreg = CellRegPy(cfg)
+    mouse_table, mouse_data = cellreg.run([mouse_folder])
+
+    if export_csv:
+        try:
+            out_dir = mouse_folder / '1_CellReg'
+            out_dir.mkdir(exist_ok=True)
+            mouse_table.to_csv(out_dir / 'mouse_table.csv', index=False)
+            wide = (mouse_table
+                    .pivot_table(index='cellRegID', columns='Session', values='suite2pID',
+                                 aggfunc='first', fill_value=0)
+                    .sort_index())
+            wide.to_csv(out_dir / 'mouse_table_wide.csv')
+        except Exception:
+            pass
+
+    return mouse_table, mouse_data
+
 __all__ = [
     # Main classes
     'CellRegConfig',
     'CellRegPy',
+    'run_pipeline',
     'MeanImageAligner',
     # Data loading
     'load_cellreg_mat',

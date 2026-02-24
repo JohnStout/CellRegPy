@@ -25,6 +25,7 @@ from .cellregpy import (
     compute_centroids,
     suite2pToCellReg,
     compute_centroid_projections,
+    run_pipeline,
     # Probabilistic modelling
     estimate_num_bins,
     compute_data_distribution,
