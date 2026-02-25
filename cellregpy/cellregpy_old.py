@@ -477,81 +477,6 @@ def ensure_valid_field_name(name: str) -> str:
     return name
 
 
-
-def _truncate_field_name(name: str, max_len: int = 63) -> str:
-    """Truncate a (sanitized) field name to <= max_len chars with a stable hash suffix."""
-    name = str(name)
-    if len(name) <= max_len:
-        return name
-    import hashlib
-    h = hashlib.md5(name.encode("utf-8")).hexdigest()[:8]
-    keep = max_len - 9  # "_" + 8 hex
-    return f"{name[:keep]}_{h}"
-
-
-def sanitize_for_mat(obj: Any) -> Any:
-    """Recursively sanitize nested dict keys + None values for scipy.io.savemat."""
-    if obj is None:
-        return np.nan
-    if isinstance(obj, dict):
-        out: Dict[str, Any] = {}
-        used = set()
-        for k, v in obj.items():
-            kk = _truncate_field_name(ensure_valid_field_name(k))
-            # ensure unique
-            base = kk
-            c = 1
-            while kk in used:
-                c += 1
-                kk = _truncate_field_name(f"{base}_{c}")
-            used.add(kk)
-            out[kk] = sanitize_for_mat(v)
-        return out
-    if isinstance(obj, (list, tuple)):
-        return [sanitize_for_mat(x) for x in obj]
-    if isinstance(obj, np.ndarray):
-        if obj.dtype == object:
-            return np.array([sanitize_for_mat(x) for x in obj], dtype=object)
-        return obj
-    return obj
-
-
-def get_session_unix_time(session_root: Union[str, Path]) -> Optional[int]:
-    """Extract Unix time from Experiment.xml (matches MATLAB metadata.Date.uTimeAttribute)."""
-    session_root = Path(session_root)
-    exp = session_root / "Experiment.xml"
-    if not exp.exists():
-        # light fallback search
-        try:
-            exp = next(session_root.rglob("Experiment.xml"))
-        except StopIteration:
-            return None
-        except Exception:
-            return None
-    try:
-        import xml.etree.ElementTree as ET
-        tree = ET.parse(str(exp))
-        root = tree.getroot()
-        # look for a tag named 'Date' anywhere
-        date_el = None
-        for el in root.iter():
-            if el.tag.lower().endswith("date"):
-                date_el = el
-                break
-        if date_el is None:
-            return None
-        # common attribute names
-        for key in ("uTime", "utime", "uTimeAttribute", "utimeattribute"):
-            if key in date_el.attrib:
-                val = date_el.attrib[key]
-                try:
-                    return int(float(val))
-                except Exception:
-                    return None
-        return None
-    except Exception:
-        return None
-
 def empty_cell_erase(cell_list: List) -> Tuple[List, List[int]]:
     """
     Remove empty elements from list and return indices of removed elements.
@@ -2151,11 +2076,10 @@ class CellRegPy:
         #   - final registered projections + pairwise overlap
         # ------------------------------------------------------------------
         if bool(getattr(cfg, 'save_figures', False)):
+            import os
+            import matplotlib.pyplot as plt
             try:
-                import os
-                import matplotlib.pyplot as plt
-                try:
-                    from .plotting import (
+                from .plotting import (
                     plot_session_projections,
                     validate_alignment_deck,
                     plot_x_y_displacements,
@@ -2165,9 +2089,10 @@ class CellRegPy:
                     savefig_both,
                     _extract_p_from_model_string,
                     _compute_histogram_distribution,
-                    )
-                except Exception:
-                    from cellregpy.plotting import (
+                )
+            except ImportError:
+                # fallback if someone is running from a non-installed source checkout
+                from cellregpy.plotting import (
                     plot_session_projections,
                     validate_alignment_deck,
                     plot_x_y_displacements,
@@ -2177,7 +2102,7 @@ class CellRegPy:
                     savefig_both,
                     _extract_p_from_model_string,
                     _compute_histogram_distribution,
-                    )
+                )
 
                 fig_dir = results_dir.parent / 'Figures'
                 fig_dir.mkdir(parents=True, exist_ok=True)
@@ -2365,17 +2290,7 @@ class CellRegPy:
             plane0_path = Path(plane0_path)
             # session_root = .../<session>
             session_root = plane0_path.parents[1] if plane0_path.name == "plane0" else plane0_path
-            session_name = ensure_valid_field_name(session_root.name)
-            session_key = session_name
-            # ensure unique keys (rare, but can happen if folder names collide)
-            if session_key in mouse_data["sessions"]:
-                base = session_key
-                c = 1
-                while session_key in mouse_data["sessions"]:
-                    c += 1
-                    session_key = f"{base}_{c}"
-
-            unix_time = get_session_unix_time(session_root)
+            session_key = str(session_root)
 
             try:
                 iscell = get_iscell(plane0_path)  # bool array length n_rois
@@ -2385,7 +2300,6 @@ class CellRegPy:
             mouse_data["sessions"][session_key] = {
                 "session_root": str(session_root),
                 "session_name": session_root.name,
-                "unixTime": unix_time,
                 "plane0_path": str(plane0_path),
                 "iscell": iscell,
                 "n_rois": int(len(iscell)) if iscell is not None else None,
@@ -2510,14 +2424,12 @@ class CellRegPy:
 
             for rid in s2p_ids:
                 rows.append({
-                    "MouseName": mouse_name,
+                    "Mouse": mouse_name,
+                    "SessionPath": str(sinfo.get("session_root", session_key)),
                     "Session": str(sinfo.get("session_name", Path(session_key).name)),
-                    "UnixTime": sinfo.get("unixTime", np.nan),
                     "suite2pID": int(rid),
                     "cellRegID": 0,
                     "fovID": [],   # list[int]
-                    # extra (useful for joins back to disk paths)
-                    "SessionPath": str(sinfo.get("session_root", session_key)),
                 })
 
         mouse_table = pd.DataFrame(rows)
@@ -2688,25 +2600,15 @@ class CellRegPy:
         mouse_table.to_pickle(mouse_folder / 'mouse_table.pkl')
         
         # Also save as .mat for MATLAB compatibility
-        # Save table even if mouse_data export fails
         try:
+            savemat(str(mouse_folder / 'mouse_data.mat'), 
+                   {'mouse_data': mouse_data}, do_compression=True)
+            # For table, save as struct
             table_dict = mouse_table.to_dict('list')
             savemat(str(mouse_folder / 'mouse_table.mat'),
-                   {'mouse_table': table_dict},
-                   do_compression=True,
-                   long_field_names=True)
+                   {'mouse_table': table_dict}, do_compression=True)
         except Exception as e:
-            warnings.warn(f"Could not save mouse_table.mat: {e}")
-
-        # Save mouse_data with MATLAB-safe fieldnames
-        try:
-            mouse_data_mat = sanitize_for_mat(mouse_data)
-            savemat(str(mouse_folder / 'mouse_data.mat'),
-                   {'mouse_data': mouse_data_mat},
-                   do_compression=True,
-                   long_field_names=True)
-        except Exception as e:
-            warnings.warn(f"Could not save mouse_data.mat: {e}")
+            warnings.warn(f"Could not save .mat files: {e}")
 
 
 # ============================================================================ #
