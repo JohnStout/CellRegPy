@@ -56,17 +56,27 @@ from cellregpy import (
 
 # ---- Matplotlib setup ----
 import matplotlib
-# Set INLINE_PLOTS = True to render in VS Code interactive window;
-# False for pop-out TkAgg windows.
-INLINE_PLOTS = True
+# Auto-detect: True in Jupyter/VS Code interactive, False in command-line scripts
+def _is_interactive():
+    try:
+        from IPython import get_ipython
+        return get_ipython() is not None
+    except Exception:
+        return False
+INLINE_PLOTS = _is_interactive()
 if not INLINE_PLOTS:
     try:
-        matplotlib.use('TkAgg')
+        matplotlib.use('TkAgg')  # GUI backend for pop-up windows
     except Exception:
         pass
 import matplotlib.pyplot as plt
 if not INLINE_PLOTS:
     plt.ion()  # interactive mode — figures display as they are created
+
+# Enable faulthandler to get C-level tracebacks on segfaults
+import faulthandler
+faulthandler.enable()
+
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -243,15 +253,12 @@ def session_names_to_labels(session_names, N):
 
 
 def savefig_both(fig, out_base, *, dpi=200, also_pdf=False, show=False):
-    if out_base is not None:
-        os.makedirs(os.path.dirname(out_base) or '.', exist_ok=True)
-        fig.savefig(out_base + ".png", dpi=dpi, bbox_inches="tight")
-        if also_pdf:
-            fig.savefig(out_base + ".pdf", bbox_inches="tight")
+    # Display only (savefig crashes on this system)
     if INLINE_PLOTS:
         plt.show()
-    elif not show:
-        plt.close(fig)
+    else:
+        fig.canvas.draw_idle()
+        fig.canvas.flush_events()
 
 
 # ============================================================================ #
@@ -261,16 +268,19 @@ def savefig_both(fig, out_base, *, dpi=200, also_pdf=False, show=False):
 
 def plot_session_projections(footprints_projections, out_dir, show=False, also_pdf=False):
     """Plots grayscale projections of all sessions (Stage 1)."""
+    import sys
     if footprints_projections is None or len(footprints_projections) == 0:
         return
     num_sessions = len(footprints_projections)
     subx = 4
     suby = int(np.ceil(num_sessions / subx))
+    print("    [plot] creating figure...", flush=True)
     if num_sessions <= 4:
         fig, axes = plt.subplots(1, num_sessions, figsize=(4 * num_sessions, 5))
         if num_sessions == 1: axes = [axes]
     else:
         fig, axes = plt.subplots(suby, subx, figsize=(4 * subx, 4 * suby))
+    print("    [plot] figure created, rendering...", flush=True)
     axes_flat = np.atleast_1d(axes).ravel()
     for i in range(len(axes_flat)):
         if i < num_sessions:
@@ -280,9 +290,12 @@ def plot_session_projections(footprints_projections, out_dir, show=False, also_p
             axes_flat[i].set_title(f'Session {i + 1}', fontsize=14, fontweight='bold')
         else:
             axes_flat[i].axis('off')
+    print(f"    [plot] rendered, saving to {out_dir}...", flush=True)
     savefig_both(fig, os.path.join(out_dir, "Stage 1 - spatial footprints projections"), also_pdf=also_pdf, show=show)
+    print("    [plot] saved, closing...", flush=True)
     if not INLINE_PLOTS and not show:
         plt.close(fig)
+    print("    [plot] done", flush=True)
 
 
 def validate_alignment_deck(
@@ -934,6 +947,9 @@ def run_pipeline(folder_path: str):
     """Run the full CellReg validation pipeline matching MATLAB's
     batchRunCellReg(folder_path, [], [], true)."""
 
+    # Version check — confirm this is the latest synced file
+    print(f"[SYNC CHECK] INLINE_PLOTS={INLINE_PLOTS}, matplotlib backend={matplotlib.get_backend()}")
+
     normalized_maximal_distance = maximal_distance / microns_per_pixel
 
     print("=" * 60)
@@ -973,6 +989,11 @@ def run_pipeline(folder_path: str):
     # ================================================================== #
     #  STAGE 1 — Load spatial footprints + projections (MATLAB lines 206-219)
     # ================================================================== #
+    test_run = True
+    if test_run:
+        import random
+        sess_fovs = random.sample(sess_fovs,4)
+
     print("\n--- Stage 1: Loading spatial footprints ---")
     spatial_footprints_raw = []
     for sf in sess_fovs:
@@ -993,8 +1014,8 @@ def run_pipeline(folder_path: str):
     # ================================================================== #
     print("\n--- Loading mean images ---")
     mean_images = []
-    for pf in plane0_folders:
-        mi = get_mean_image(pf, apply_drift_correction=True)
+    for pf in sess_fovs:
+        mi = get_mean_image(Path(pf).parent, apply_drift_correction=True)
         mean_images.append(mi)
         print(f"  {Path(pf).parent.parent.name}: {mi.shape}")
 
@@ -1097,6 +1118,151 @@ def run_pipeline(folder_path: str):
         show=SHOW_FIGURES,
     )
     print("  ✓ Alignment validation figures done")
+
+    # ================================================================== #
+    #  STAGE 2b — HP / LP / BP Filter Visualization
+    # ================================================================== #
+    print("\n--- Stage 2b: Filter visualization for alignment diagnostics ---")
+    from scipy.ndimage import gaussian_filter as _gf
+
+    blur_hp = 12.0   # high-pass sigma (matches CellRegConfig default)
+    blur_lp = 5.0    # low-pass sigma
+    blur_bp1 = 2.0   # band-pass sigma (small)
+    blur_bp2 = 12.0  # band-pass sigma (large)
+
+    # --- Per-session HP/LP/BP filter views ---
+    fig_filt, axes_filt = plt.subplots(n_sessions, 4, figsize=(20, 5 * n_sessions))
+    if n_sessions == 1:
+        axes_filt = axes_filt[np.newaxis, :]
+
+    for i in range(n_sessions):
+        img = mean_images[i].astype(np.float32)
+        img_safe = np.nan_to_num(img, nan=0.0)
+        hp = img_safe - _gf(img_safe, blur_hp)
+        lp = _gf(img_safe, blur_lp)
+        bp = _gf(img_safe, blur_bp1) - _gf(img_safe, blur_bp2)
+
+        for ax_idx, (data, title) in enumerate([
+            (img_safe, f'Session {i+1}: Raw'),
+            (hp,       f'Session {i+1}: High-Pass (σ={blur_hp})'),
+            (lp,       f'Session {i+1}: Low-Pass (σ={blur_lp})'),
+            (bp,       f'Session {i+1}: Band-Pass ({blur_bp1}-{blur_bp2})'),
+        ]):
+            ax = axes_filt[i, ax_idx]
+            vmin, vmax = np.nanpercentile(data, [1, 99])
+            if vmax <= vmin:
+                vmax = vmin + 1
+            ax.imshow(data, cmap='gray', vmin=vmin, vmax=vmax)
+            ax.set_title(title, fontsize=11, fontweight='bold')
+            ax.axis('off')
+
+    fig_filt.suptitle('Stage 2b — Filtered Mean Images', fontsize=16, fontweight='bold')
+    fig_filt.tight_layout(rect=[0, 0, 1, 0.96])
+    if fig_dir:
+        savefig_both(fig_filt, os.path.join(fig_dir, "Stage 2b - filtered mean images"),
+                     show=SHOW_FIGURES)
+    if not INLINE_PLOTS and not SHOW_FIGURES:
+        plt.close(fig_filt)
+
+    # --- Pairwise HP-filtered overlay: ref vs each session (pre and post alignment) ---
+    ref_img = mean_images[reference_session_index].astype(np.float32)
+    ref_safe = np.nan_to_num(ref_img, nan=0.0)
+    ref_hp = ref_safe - _gf(ref_safe, blur_hp)
+
+    other_indices = [i for i in range(n_sessions) if i != reference_session_index]
+    if other_indices:
+        fig_ov, axes_ov = plt.subplots(len(other_indices), 4,
+                                       figsize=(20, 5 * len(other_indices)))
+        if len(other_indices) == 1:
+            axes_ov = axes_ov[np.newaxis, :]
+
+        for row, si in enumerate(other_indices):
+            # Pre-alignment HP
+            mov_raw = mean_images[si].astype(np.float32)
+            mov_safe = np.nan_to_num(mov_raw, nan=0.0)
+            mov_hp = mov_safe - _gf(mov_safe, blur_hp)
+
+            # Post-alignment HP (apply the same transform that was used)
+            from skimage import transform as _sktf
+            if maximal_cross_correlation[si] >= alignable_threshold:
+                # Reconstruct the aligned mean image using the stored tform
+                _, _, _, tform_i, _, _ = aligner.align(
+                    mean_images[reference_session_index],
+                    mean_images[si],
+                    filter_mode='highpass',
+                    outlier_mode='off'
+                )
+                if tform_i is not None:
+                    aligned_mi = _sktf.warp(
+                        mov_safe, tform_i.inverse, output_shape=ref_safe.shape,
+                        order=1, preserve_range=True, mode='constant', cval=0.0
+                    )
+                else:
+                    aligned_mi = mov_safe
+            else:
+                aligned_mi = mov_safe
+            aligned_hp = aligned_mi - _gf(aligned_mi, blur_hp)
+
+            # Normalize for overlay
+            def _norm_hp(x):
+                lo, hi = np.percentile(x, [2, 98])
+                if hi <= lo: return np.zeros_like(x)
+                return np.clip((x - lo) / (hi - lo), 0, 1)
+
+            rn = _norm_hp(ref_hp)
+            mn = _norm_hp(mov_hp)
+            an = _norm_hp(aligned_hp)
+
+            # Pre-alignment overlay (cyan=ref, red=moving)
+            pre_overlay = np.zeros((*ref_hp.shape, 3))
+            pre_overlay[..., 0] = mn
+            pre_overlay[..., 1] = rn
+            pre_overlay[..., 2] = rn
+
+            # Post-alignment overlay
+            post_overlay = np.zeros((*ref_hp.shape, 3))
+            post_overlay[..., 0] = an
+            post_overlay[..., 1] = rn
+            post_overlay[..., 2] = rn
+
+            # Pre-alignment raw correlation
+            both_valid_pre = np.isfinite(ref_img) & np.isfinite(mov_raw)
+            corr_pre = np.corrcoef(ref_img[both_valid_pre].ravel(),
+                                   mov_raw[both_valid_pre].ravel())[0, 1] if both_valid_pre.sum() > 100 else float('nan')
+
+            # Post-alignment raw correlation
+            both_valid_post = (aligned_mi > 0) & np.isfinite(ref_img)
+            corr_post = np.corrcoef(ref_img[both_valid_post].ravel(),
+                                    aligned_mi[both_valid_post].ravel())[0, 1] if both_valid_post.sum() > 100 else float('nan')
+
+            titles = [
+                f'S{si+1} HP (pre)',
+                f'Overlay pre (r={corr_pre:.3f})',
+                f'S{si+1} HP (post)',
+                f'Overlay post (r={corr_post:.3f})',
+            ]
+            imgs = [mov_hp, pre_overlay, aligned_hp, post_overlay]
+            for col, (data, title) in enumerate(zip(imgs, titles)):
+                ax = axes_ov[row, col]
+                if data.ndim == 2:
+                    vmin, vmax = np.percentile(data, [2, 98])
+                    if vmax <= vmin: vmax = vmin + 1
+                    ax.imshow(data, cmap='gray', vmin=vmin, vmax=vmax)
+                else:
+                    ax.imshow(np.clip(data, 0, 1))
+                ax.set_title(title, fontsize=11, fontweight='bold')
+                ax.axis('off')
+
+        fig_ov.suptitle('Stage 2b — HP-Filtered Alignment Overlays (Cyan=Ref, Red=Moving)',
+                        fontsize=14, fontweight='bold')
+        fig_ov.tight_layout(rect=[0, 0, 1, 0.96])
+        if fig_dir:
+            savefig_both(fig_ov, os.path.join(fig_dir,
+                         "Stage 2b - HP alignment overlays"), show=SHOW_FIGURES)
+        if not INLINE_PLOTS and not SHOW_FIGURES:
+            plt.close(fig_ov)
+
+    print("  ✓ Stage 2b filter visualization done")
 
     # ================================================================== #
     #  STAGE 3a — Data distribution (MATLAB lines 449-466)
@@ -1582,4 +1748,12 @@ def run_pipeline(folder_path: str):
 #                                   MAIN                                       #
 # ============================================================================ #
 if __name__ == "__main__":
-    run_pipeline(folder_path)
+    import traceback
+    try:
+        run_pipeline(folder_path)
+    except Exception as e:
+        print(f"\n\n{'='*60}")
+        print(f"  PIPELINE ERROR: {e}")
+        print(f"{'='*60}")
+        traceback.print_exc()
+        input("\nPress Enter to exit...")
