@@ -2,13 +2,16 @@
 
 **Cross-session cell registration for calcium imaging in Python. Works with Suite2P!**
 
-A Python port of the MATLAB [CellReg](https://github.com/zivlab/CellReg) with key improvements meant to fit with Suite2P results:
+A Python port of the MATLAB [CellReg](https://github.com/zivlab/CellReg) with key improvements meant to follow suite with a Suite2P pipeline:
 
-- **Mean image alignment** — multi-transform search with high-pass filtering (innovation over standard CellReg)
+- **Mean image alignment** — multi-transform search with high-pass filtering (innovation over standard CellReg), this is followed by footprint alignment to choose the best approach.
 - **Probabilistic cell matching** — based on spatial footprints and centroid distances
 - **Automatic session detection** — finds suite2p `plane0` folders from a mouse directory - Currently only supports single plane imaging
 - **MATLAB-matching figures** — reproduces all CellReg diagnostic figures
-- **Combined modeling approach** - Returns aligned cells using multiple different methods for detecting cells, including a new combined centroid-distance + spatial correlation filtering method!
+- **Combined modeling approach** - If there is a tie between spatial correlation and centroid distance models, the algorithm defaults to centroid distance and uses spatial correlation as a filter
+- **Backup for Failed Modeling** - If sessions being aligned are too similar, modeling can fail. As a backup, an intersection over union technique is performed.
+- **Improved CellReg Outputs** - Rather than a large matrix of cellID combinations, we now return a table called 'mouse_table' which can be loaded or viewed in the GUI
+- **GUI for Validation** - A GUI used to check that your footprint alignment is accurate.
 
 ## Installation
 
