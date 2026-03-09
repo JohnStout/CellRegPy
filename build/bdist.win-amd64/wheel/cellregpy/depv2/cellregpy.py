@@ -38,106 +38,115 @@ from datetime import datetime
 # ============================================================================ #
 #                           CONFIGURATION DATACLASS                            #
 # ============================================================================ #
-from dataclasses import dataclass
-from typing import Tuple
 
 @dataclass
 class CellRegConfig:
     """
     Configuration parameters for CellRegPy.
-    Mirrors the parameter space from batchRunCellReg.m.
+    
+    Mirrors the parameter space from batchRunCellReg.m (lines 106-131).
     """
-
     # Memory and display
     memory_efficient_run: bool = True
-    figures_visibility: str = 'on'   # changed from 'off'
-
+    figures_visibility: str = 'off'  # 'on' or 'off'
+    
     # Pixel scaling
     microns_per_pixel: float = 2.0
-
+    
     # Redundancy removal
     remove_redundancies: bool = True
-
+    
     # Alignment correlation thresholds
     sufficient_correlation_centroids: float = 0.2
     sufficient_correlation_footprints: float = 0.3
     correlation_threshold: float = 0.65
-
+    
     # Alignment modeling
-    alignment_type: str = 'translations_and_rotations'
+    alignment_type: str = 'translations_and_rotations'  
+    # Options: 'translations', 'translations_and_rotations', 'non_rigid'
     use_parallel_processing: bool = True
-    maximal_rotation: float = 30.0
-    transformation_smoothness: float = 2.0
-
+    maximal_rotation: float = 30.0  # degrees
+    transformation_smoothness: float = 2.0  # range 0.5-3
+    
     # Probabilistic modeling
-    maximal_distance: float = 14.0
+    maximal_distance: float = 15.0  # µm, cell-pairs beyond this are different cells
     p_same_certainty_threshold: float = 0.95
-
+    
     # Final registration
-    registration_approach: str = 'Probabilistic'
+    registration_approach: str = 'Probabilistic'  # or 'Simple threshold'
     p_same_threshold: float = 0.5
-
+    
     # Probabilistic model selection
+    # Options: 'Spatial correlation' or 'Centroid distance'
     model_type: str = "auto"
 
-    # If model_type="auto": treat near-ties (by overlap MSE) as a signal to enable dual-model (centroid primary + corr veto)
-    model_tie_rel_tol: float = 0.01
-    dual_on_model_tie: bool = True
-
-    # Dual-model final registration
+    # Dual-model final registration (Stage 6 style):
+    #   centroid p_same drives clustering, then spatial correlation is used as a veto/floor.
     dual_model: bool = False
-    apply_spatial_floor_filter: bool = False
+    apply_spatial_floor_filter: bool = False   # alias; if True, dual_model behavior is enabled
     spatial_corr_floor: float = 0.5
 
-    # Figure saving
-    save_figures: bool = True        # changed from False
-    also_pdf: bool = True
+    # Figure saving (per FOV) — mirrors validate_alignment_script outputs
+    save_figures: bool = False
+    also_pdf: bool = False
     close_figures: bool = True
+
 
     # Debug / short runs
     test_run: bool = False
-    test_run_type: str = 'test random alignment'
+    test_run_type: str = 'test random alignment'  # or 'test difficult alignment'
 
-    # Mean image alignment parameters
-    blur_hp: float = 12.0
-    blur_lp: float = 5.0
-    blur_bp1: float = 2.0
-    blur_bp2: float = 12.0
-    blur_reg: float = 2.0
-    min_overlap_hard: float = 0.25
-    gamma_overlap: float = 0.75
-    z_thresh: float = 8.0
-    min_area: int = 25
-    alignable_threshold: float = 0.3
+    # Mean image alignment parameters (from mean_img_alignment.m)
+    blur_hp: float = 12.0  # sigma for highpass background estimate, was 12.0
+    blur_lp: float = 5.0   # sigma for lowpass scoring
+    blur_bp1: float = 2.0  # DoG: small sigma
+    blur_bp2: float = 12.0 # DoG: large sigma
+    blur_reg: float = 2.0  # mild blur for registration
+    min_overlap_hard: float = 0.25  # require >= 25% overlap
+    gamma_overlap: float = 0.75     # soft penalty exponent
+    z_thresh: float = 8.0           # robust z cutoff for outliers
+    min_area: int = 25              # px
+    alignable_threshold: float = 0.3  # correlation threshold for alignability
 
     # Alignment fallback options
-    alignment_fallback_mode: str = 'none'
+    alignment_fallback_mode: str = 'two_stage'
+    # Options: 'none', 'footprints', 'mean_then_footprints'
     footprint_projection_threshold: float = 0.5
     footprint_filter_mode: str = 'highpass'
     footprint_outlier_mode: str = 'off'
-
-    # Auto-simple mode
-    auto_simple_on_high_similarity: bool = False
+    
+    # Auto-simple mode: when sessions are already extremely similar,
+    # MATLAB-style probabilistic mixture modeling can become ill-posed (degenerate distributions).
+    # If enabled and both mean-image correlations exceed thresholds,
+    # switch to a deterministic IoU+Hungarian registration.
+    auto_simple_on_high_similarity: bool = True
     auto_simple_raw_corr_threshold: float = 0.90
     auto_simple_aligned_corr_threshold: float = 0.95
-    auto_simple_method: str = 'iou_hungarian'
+    auto_simple_method: str = 'iou_hungarian'  # or 'centroid_greedy'
 
-    # Auto-flex mode
+    # Auto-flex mode: if mean-image alignment is essentially perfect (peak score high),
+    # CellReg mixture modeling can become ill-posed because the neighbour-pair cloud is dominated
+    # by many 'wrong but nearby' cells in dense fields.
+    # In this regime we:
+    #   (1) adapt maximal_distance downwards (e.g., 14→4 µm) to tighten the candidate pool, and
+    #   (2) also try deterministic IoU+Hungarian, with QC plots for both.
     auto_flex_on_high_peak: bool = True
     auto_flex_peak_threshold: float = 0.95
-    auto_flex_maximal_distance_um_candidates: Tuple[float, ...] = (14.0, 7.0)
+    auto_flex_maximal_distance_um_candidates: Tuple[float, ...] = (14.0, 12.0, 10.0, 8.0, 6.0, 4.0)
     auto_flex_disp_target_um: float = 2.0
     auto_flex_choose_best: bool = True
 
     # Simple IoU+Hungarian registration parameters
-    simple_mask_threshold: float = 0.15   # changed from 0.20
-    simple_iou_threshold: float = 0.10    # changed from 0.25
-    simple_dist_threshold_um: float = 6.0
-    simple_cost_beta: float = 0.25
-
+    simple_mask_threshold: float = 0.20   # relative-to-max per ROI, used to binarize masks
+    simple_iou_threshold: float = 0.25    # accept match if IoU >= this
+    simple_dist_threshold_um: float = 6.0 # accept match if centroid dist <= this (µm)
+    simple_cost_beta: float = 0.25        # distance penalty weight in assignment cost
+    
     @property
     def normalized_maximal_distance(self) -> float:
+        """Maximal distance in pixels."""
         return self.maximal_distance / self.microns_per_pixel
+
 
 # ============================================================================ #
 #                          SUITE2P DATA LOADING                                #
@@ -520,12 +529,9 @@ def _truncate_field_name(name: str, max_len: int = 63) -> str:
 
 
 def sanitize_for_mat(obj: Any) -> Any:
-    """Recursively sanitize nested dict keys + problematic values for scipy.io.savemat."""
+    """Recursively sanitize nested dict keys + None values for scipy.io.savemat."""
     if obj is None:
         return np.nan
-    # pathlib Paths -> strings (savemat can't handle Path objects)
-    if isinstance(obj, Path):
-        return str(obj)
     if isinstance(obj, dict):
         out: Dict[str, Any] = {}
         used = set()
@@ -2657,22 +2663,6 @@ class CellRegPy:
                     else:
                         raise ValueError(f"Unknown model_type: {cfg.model_type!r}. Use 'auto', 'Spatial correlation', or 'Centroid distance'.")
 
-                # If model_type is auto and the two models are a near-tie by overlap MSE,
-                # enable dual-model (centroid-primary clustering + spatial-correlation veto) for robustness.
-                if raw_model_type.lower() in ('auto', 'best', 'matlab') and bool(getattr(cfg, 'dual_on_model_tie', True)):
-                    try:
-                        c_mse = float(centroid_overlap_mse)
-                        r_mse = float(corr_overlap_mse)
-                        denom = max(1e-12, min(c_mse, r_mse))
-                        tie_rel_tol = float(getattr(cfg, 'model_tie_rel_tol', 0.01))
-                        is_tie = (np.isfinite(c_mse) and np.isfinite(r_mse) and (abs(c_mse - r_mse) <= tie_rel_tol * denom))
-                    except Exception:
-                        is_tie = False
-                    if is_tie:
-                        use_dual_model = True
-                        print(f"  ⚖ Model MSE tie detected (centroid_mse={c_mse:.4g}, corr_mse={r_mse:.4g}); "
-                              "enabling dual-model (centroid primary + corr veto).")
-
                 # Dual-model override: force centroid-primary clustering, then apply spatial floor veto
                 model_used = 'Centroid distance' if use_dual_model else best_model_string
 
@@ -3562,7 +3552,7 @@ class CellRegPy:
         # Also save as .mat for MATLAB compatibility
         # Save table even if mouse_data export fails
         try:
-            table_dict = sanitize_for_mat(mouse_table.to_dict('list'))
+            table_dict = mouse_table.to_dict('list')
             savemat(str(mouse_folder / 'mouse_table.mat'),
                    {'mouse_table': table_dict},
                    do_compression=True,
@@ -5801,41 +5791,26 @@ def cluster_cells(cell_to_index_map: np.ndarray,
 #                             CONVENIENCE API                                  #
 # ============================================================================ #
 
-
 def run_pipeline(folder_path: Union[str, Path],
                  cfg: Optional[CellRegConfig] = None,
                  *,
-                 export_csv: bool = True,
-                 save_figures: Optional[bool] = None,
-                 figures_visibility: Optional[str] = None,
-                 also_pdf: Optional[bool] = None,
-                 spatial_corr_floor: Optional[float] = None) -> Tuple[pd.DataFrame, Dict]:
+                 spatial_corr_floor: float = 0.5,
+                 save_figures: bool = True,
+                 figures_visibility: str = 'off',
+                 export_csv: bool = True) -> Tuple[pd.DataFrame, Dict]:
     """One-call entrypoint: run the full CellRegPy pipeline on a mouse folder.
 
-    This wrapper **does not** override your modeling choices. It respects `cfg`:
-
-    - `cfg.model_type`:
-        * "auto" (default): fit BOTH centroid-distance and spatial-correlation models,
-          choose the best by overlap MSE (MATLAB-like). If the two MSEs are a near-tie
-          (`cfg.model_tie_rel_tol`), and `cfg.dual_on_model_tie=True`, CellRegPy will
-          enable the dual-model mode (centroid-primary clustering + spatial-correlation veto).
-        * "Centroid distance" or "Spatial correlation": force that single model.
-
-    - Similarity fallback:
-        * If `cfg.auto_simple_on_high_similarity` and/or `cfg.auto_flex_on_high_peak`
-          triggers, probabilistic modeling is skipped and SIMPLE IoU+Hungarian is used.
-
-    - Alignment:
-        * Controlled by `cfg.alignment_fallback_mode`.
-          For speed, the current default in `CellRegConfig` is `'none'` (mean-image only).
-          No spatial-footprint alignment is performed unless you explicitly enable it later.
+    This enforces the Stage-6 dual-model approach:
+        1) centroid-distance probabilistic model drives clustering
+        2) spatial correlation is used ONLY as a post-hoc veto (floor cutoff)
 
     Args:
         folder_path: Mouse folder containing session subfolders.
         cfg: Optional CellRegConfig. If None, defaults are used.
+        spatial_corr_floor: Spatial correlation veto threshold (default 0.5).
+        save_figures: Save per-FOV figures into 1_CellReg/FOV*/Figures (default True).
+        figures_visibility: 'on' to display; 'off' to save+close (default 'off').
         export_csv: Save mouse_table.csv and mouse_table_wide.csv into 1_CellReg (default True).
-        save_figures / figures_visibility / also_pdf / spatial_corr_floor:
-            Optional convenience overrides. If None, the value already in `cfg` is used.
 
     Returns:
         (mouse_table, mouse_data)
@@ -5843,18 +5818,16 @@ def run_pipeline(folder_path: Union[str, Path],
     mouse_folder = Path(folder_path)
     cfg = cfg or CellRegConfig()
 
-    # Optional convenience overrides (prefer keeping these in CellRegConfig)
-    if save_figures is not None:
-        cfg.save_figures = bool(save_figures)
-    if figures_visibility is not None:
-        cfg.figures_visibility = str(figures_visibility)
-    if also_pdf is not None:
-        cfg.also_pdf = bool(also_pdf)
-    if spatial_corr_floor is not None:
-        cfg.spatial_corr_floor = float(spatial_corr_floor)
+    # Enforce dual-model final registration
+    cfg.model_type = 'Centroid distance'
+    cfg.dual_model = True
+    cfg.apply_spatial_floor_filter = True
+    cfg.spatial_corr_floor = float(spatial_corr_floor)
 
-    # Close figures when not explicitly showing them (keeps runs fast)
-    cfg.close_figures = (str(getattr(cfg, 'figures_visibility', 'off')).lower() != 'on')
+    # Figures
+    cfg.save_figures = bool(save_figures)
+    cfg.figures_visibility = str(figures_visibility)
+    cfg.close_figures = True
 
     cellreg = CellRegPy(cfg)
     mouse_table, mouse_data = cellreg.run([mouse_folder])
@@ -5866,14 +5839,13 @@ def run_pipeline(folder_path: Union[str, Path],
             mouse_table.to_csv(out_dir / 'mouse_table.csv', index=False)
             wide = (mouse_table
                     .pivot_table(index='cellRegID', columns='Session', values='suite2pID',
-                                 aggfunc='first')
+                                 aggfunc='first', fill_value=0)
                     .sort_index())
             wide.to_csv(out_dir / 'mouse_table_wide.csv')
         except Exception:
             pass
 
     return mouse_table, mouse_data
-
 
 __all__ = [
     # Main classes

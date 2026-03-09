@@ -80,10 +80,6 @@ class CellRegConfig:
     # Probabilistic model selection
     model_type: str = "auto"
 
-    # If model_type="auto": treat near-ties (by overlap MSE) as a signal to enable dual-model (centroid primary + corr veto)
-    model_tie_rel_tol: float = 0.01
-    dual_on_model_tie: bool = True
-
     # Dual-model final registration
     dual_model: bool = False
     apply_spatial_floor_filter: bool = False
@@ -111,7 +107,7 @@ class CellRegConfig:
     alignable_threshold: float = 0.3
 
     # Alignment fallback options
-    alignment_fallback_mode: str = 'none'
+    alignment_fallback_mode: str = 'two_stage'
     footprint_projection_threshold: float = 0.5
     footprint_filter_mode: str = 'highpass'
     footprint_outlier_mode: str = 'off'
@@ -125,7 +121,7 @@ class CellRegConfig:
     # Auto-flex mode
     auto_flex_on_high_peak: bool = True
     auto_flex_peak_threshold: float = 0.95
-    auto_flex_maximal_distance_um_candidates: Tuple[float, ...] = (14.0, 7.0)
+    auto_flex_maximal_distance_um_candidates: Tuple[float, ...] = (14.0, 12.0, 10.0, 8.0, 6.0, 4.0)
     auto_flex_disp_target_um: float = 2.0
     auto_flex_choose_best: bool = True
 
@@ -2656,22 +2652,6 @@ class CellRegPy:
                         best_model_string = 'Spatial correlation'
                     else:
                         raise ValueError(f"Unknown model_type: {cfg.model_type!r}. Use 'auto', 'Spatial correlation', or 'Centroid distance'.")
-
-                # If model_type is auto and the two models are a near-tie by overlap MSE,
-                # enable dual-model (centroid-primary clustering + spatial-correlation veto) for robustness.
-                if raw_model_type.lower() in ('auto', 'best', 'matlab') and bool(getattr(cfg, 'dual_on_model_tie', True)):
-                    try:
-                        c_mse = float(centroid_overlap_mse)
-                        r_mse = float(corr_overlap_mse)
-                        denom = max(1e-12, min(c_mse, r_mse))
-                        tie_rel_tol = float(getattr(cfg, 'model_tie_rel_tol', 0.01))
-                        is_tie = (np.isfinite(c_mse) and np.isfinite(r_mse) and (abs(c_mse - r_mse) <= tie_rel_tol * denom))
-                    except Exception:
-                        is_tie = False
-                    if is_tie:
-                        use_dual_model = True
-                        print(f"  ⚖ Model MSE tie detected (centroid_mse={c_mse:.4g}, corr_mse={r_mse:.4g}); "
-                              "enabling dual-model (centroid primary + corr veto).")
 
                 # Dual-model override: force centroid-primary clustering, then apply spatial floor veto
                 model_used = 'Centroid distance' if use_dual_model else best_model_string
@@ -5801,41 +5781,26 @@ def cluster_cells(cell_to_index_map: np.ndarray,
 #                             CONVENIENCE API                                  #
 # ============================================================================ #
 
-
 def run_pipeline(folder_path: Union[str, Path],
                  cfg: Optional[CellRegConfig] = None,
                  *,
-                 export_csv: bool = True,
-                 save_figures: Optional[bool] = None,
-                 figures_visibility: Optional[str] = None,
-                 also_pdf: Optional[bool] = None,
-                 spatial_corr_floor: Optional[float] = None) -> Tuple[pd.DataFrame, Dict]:
+                 spatial_corr_floor: float = 0.5,
+                 save_figures: bool = True,
+                 figures_visibility: str = 'off',
+                 export_csv: bool = True) -> Tuple[pd.DataFrame, Dict]:
     """One-call entrypoint: run the full CellRegPy pipeline on a mouse folder.
 
-    This wrapper **does not** override your modeling choices. It respects `cfg`:
-
-    - `cfg.model_type`:
-        * "auto" (default): fit BOTH centroid-distance and spatial-correlation models,
-          choose the best by overlap MSE (MATLAB-like). If the two MSEs are a near-tie
-          (`cfg.model_tie_rel_tol`), and `cfg.dual_on_model_tie=True`, CellRegPy will
-          enable the dual-model mode (centroid-primary clustering + spatial-correlation veto).
-        * "Centroid distance" or "Spatial correlation": force that single model.
-
-    - Similarity fallback:
-        * If `cfg.auto_simple_on_high_similarity` and/or `cfg.auto_flex_on_high_peak`
-          triggers, probabilistic modeling is skipped and SIMPLE IoU+Hungarian is used.
-
-    - Alignment:
-        * Controlled by `cfg.alignment_fallback_mode`.
-          For speed, the current default in `CellRegConfig` is `'none'` (mean-image only).
-          No spatial-footprint alignment is performed unless you explicitly enable it later.
+    This enforces the Stage-6 dual-model approach:
+        1) centroid-distance probabilistic model drives clustering
+        2) spatial correlation is used ONLY as a post-hoc veto (floor cutoff)
 
     Args:
         folder_path: Mouse folder containing session subfolders.
         cfg: Optional CellRegConfig. If None, defaults are used.
+        spatial_corr_floor: Spatial correlation veto threshold (default 0.5).
+        save_figures: Save per-FOV figures into 1_CellReg/FOV*/Figures (default True).
+        figures_visibility: 'on' to display; 'off' to save+close (default 'off').
         export_csv: Save mouse_table.csv and mouse_table_wide.csv into 1_CellReg (default True).
-        save_figures / figures_visibility / also_pdf / spatial_corr_floor:
-            Optional convenience overrides. If None, the value already in `cfg` is used.
 
     Returns:
         (mouse_table, mouse_data)
@@ -5843,18 +5808,16 @@ def run_pipeline(folder_path: Union[str, Path],
     mouse_folder = Path(folder_path)
     cfg = cfg or CellRegConfig()
 
-    # Optional convenience overrides (prefer keeping these in CellRegConfig)
-    if save_figures is not None:
-        cfg.save_figures = bool(save_figures)
-    if figures_visibility is not None:
-        cfg.figures_visibility = str(figures_visibility)
-    if also_pdf is not None:
-        cfg.also_pdf = bool(also_pdf)
-    if spatial_corr_floor is not None:
-        cfg.spatial_corr_floor = float(spatial_corr_floor)
+    # Enforce dual-model final registration
+    cfg.model_type = 'Centroid distance'
+    cfg.dual_model = True
+    cfg.apply_spatial_floor_filter = True
+    cfg.spatial_corr_floor = float(spatial_corr_floor)
 
-    # Close figures when not explicitly showing them (keeps runs fast)
-    cfg.close_figures = (str(getattr(cfg, 'figures_visibility', 'off')).lower() != 'on')
+    # Figures
+    cfg.save_figures = bool(save_figures)
+    cfg.figures_visibility = str(figures_visibility)
+    cfg.close_figures = True
 
     cellreg = CellRegPy(cfg)
     mouse_table, mouse_data = cellreg.run([mouse_folder])
@@ -5866,14 +5829,13 @@ def run_pipeline(folder_path: Union[str, Path],
             mouse_table.to_csv(out_dir / 'mouse_table.csv', index=False)
             wide = (mouse_table
                     .pivot_table(index='cellRegID', columns='Session', values='suite2pID',
-                                 aggfunc='first')
+                                 aggfunc='first', fill_value=0)
                     .sort_index())
             wide.to_csv(out_dir / 'mouse_table_wide.csv')
         except Exception:
             pass
 
     return mouse_table, mouse_data
-
 
 __all__ = [
     # Main classes

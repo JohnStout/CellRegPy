@@ -38,106 +38,76 @@ from datetime import datetime
 # ============================================================================ #
 #                           CONFIGURATION DATACLASS                            #
 # ============================================================================ #
-from dataclasses import dataclass
-from typing import Tuple
 
 @dataclass
 class CellRegConfig:
     """
     Configuration parameters for CellRegPy.
-    Mirrors the parameter space from batchRunCellReg.m.
+    
+    Mirrors the parameter space from batchRunCellReg.m (lines 106-131).
     """
-
     # Memory and display
     memory_efficient_run: bool = True
-    figures_visibility: str = 'on'   # changed from 'off'
-
+    figures_visibility: str = 'off'  # 'on' or 'off'
+    
     # Pixel scaling
     microns_per_pixel: float = 2.0
-
+    
     # Redundancy removal
     remove_redundancies: bool = True
-
+    
     # Alignment correlation thresholds
     sufficient_correlation_centroids: float = 0.2
     sufficient_correlation_footprints: float = 0.3
     correlation_threshold: float = 0.65
-
+    
     # Alignment modeling
-    alignment_type: str = 'translations_and_rotations'
+    alignment_type: str = 'translations_and_rotations'  
+    # Options: 'translations', 'translations_and_rotations', 'non_rigid'
     use_parallel_processing: bool = True
-    maximal_rotation: float = 30.0
-    transformation_smoothness: float = 2.0
-
+    maximal_rotation: float = 30.0  # degrees
+    transformation_smoothness: float = 2.0  # range 0.5-3
+    
     # Probabilistic modeling
-    maximal_distance: float = 14.0
+    maximal_distance: float = 15.0  # µm, cell-pairs beyond this are different cells
     p_same_certainty_threshold: float = 0.95
-
+    
     # Final registration
-    registration_approach: str = 'Probabilistic'
+    registration_approach: str = 'Probabilistic'  # or 'Simple threshold'
     p_same_threshold: float = 0.5
-
+    
     # Probabilistic model selection
+    # Options: 'Spatial correlation' or 'Centroid distance'
     model_type: str = "auto"
 
-    # If model_type="auto": treat near-ties (by overlap MSE) as a signal to enable dual-model (centroid primary + corr veto)
-    model_tie_rel_tol: float = 0.01
-    dual_on_model_tie: bool = True
-
-    # Dual-model final registration
+    # Dual-model final registration (Stage 6 style):
+    #   centroid p_same drives clustering, then spatial correlation is used as a veto/floor.
     dual_model: bool = False
-    apply_spatial_floor_filter: bool = False
+    apply_spatial_floor_filter: bool = False   # alias; if True, dual_model behavior is enabled
     spatial_corr_floor: float = 0.5
 
-    # Figure saving
-    save_figures: bool = True        # changed from False
-    also_pdf: bool = True
+    # Figure saving (per FOV) — mirrors validate_alignment_script outputs
+    save_figures: bool = False
+    also_pdf: bool = False
     close_figures: bool = True
 
-    # Debug / short runs
-    test_run: bool = False
-    test_run_type: str = 'test random alignment'
-
-    # Mean image alignment parameters
-    blur_hp: float = 12.0
-    blur_lp: float = 5.0
-    blur_bp1: float = 2.0
-    blur_bp2: float = 12.0
-    blur_reg: float = 2.0
-    min_overlap_hard: float = 0.25
-    gamma_overlap: float = 0.75
-    z_thresh: float = 8.0
-    min_area: int = 25
-    alignable_threshold: float = 0.3
-
-    # Alignment fallback options
-    alignment_fallback_mode: str = 'none'
-    footprint_projection_threshold: float = 0.5
-    footprint_filter_mode: str = 'highpass'
-    footprint_outlier_mode: str = 'off'
-
-    # Auto-simple mode
-    auto_simple_on_high_similarity: bool = False
-    auto_simple_raw_corr_threshold: float = 0.90
-    auto_simple_aligned_corr_threshold: float = 0.95
-    auto_simple_method: str = 'iou_hungarian'
-
-    # Auto-flex mode
-    auto_flex_on_high_peak: bool = True
-    auto_flex_peak_threshold: float = 0.95
-    auto_flex_maximal_distance_um_candidates: Tuple[float, ...] = (14.0, 7.0)
-    auto_flex_disp_target_um: float = 2.0
-    auto_flex_choose_best: bool = True
-
-    # Simple IoU+Hungarian registration parameters
-    simple_mask_threshold: float = 0.15   # changed from 0.20
-    simple_iou_threshold: float = 0.10    # changed from 0.25
-    simple_dist_threshold_um: float = 6.0
-    simple_cost_beta: float = 0.25
-
+    # Mean image alignment parameters (from mean_img_alignment.m)
+    blur_hp: float = 12.0  # sigma for highpass background estimate, was 12.0
+    blur_lp: float = 5.0   # sigma for lowpass scoring
+    blur_bp1: float = 2.0  # DoG: small sigma
+    blur_bp2: float = 12.0 # DoG: large sigma
+    blur_reg: float = 2.0  # mild blur for registration
+    min_overlap_hard: float = 0.25  # require >= 25% overlap
+    gamma_overlap: float = 0.75     # soft penalty exponent
+    z_thresh: float = 8.0           # robust z cutoff for outliers
+    min_area: int = 25              # px
+    alignable_threshold: float = 0.3  # correlation threshold for alignability
+    
     @property
     def normalized_maximal_distance(self) -> float:
+        """Maximal distance in pixels."""
         return self.maximal_distance / self.microns_per_pixel
+
 
 # ============================================================================ #
 #                          SUITE2P DATA LOADING                                #
@@ -520,12 +490,9 @@ def _truncate_field_name(name: str, max_len: int = 63) -> str:
 
 
 def sanitize_for_mat(obj: Any) -> Any:
-    """Recursively sanitize nested dict keys + problematic values for scipy.io.savemat."""
+    """Recursively sanitize nested dict keys + None values for scipy.io.savemat."""
     if obj is None:
         return np.nan
-    # pathlib Paths -> strings (savemat can't handle Path objects)
-    if isinstance(obj, Path):
-        return str(obj)
     if isinstance(obj, dict):
         out: Dict[str, Any] = {}
         used = set()
@@ -630,77 +597,6 @@ def _rgb_overlay(fixed, other):
     rgb[..., 2] = f        # blue  = fixed  -> cyan
     return rgb
 
-
-def compute_registered_pair_displacements(cell_to_index_map: np.ndarray,
-                                         centroid_locations: List[np.ndarray],
-                                         ref_idx: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute dx, dy (in pixels) for registered pairs (ref vs each other session).
-
-    dx = x_other - x_ref, dy = y_other - y_ref, pooled across all non-ref sessions.
-    Only rows where BOTH sessions have a non-zero entry are used.
-    """
-    cmap = np.asarray(cell_to_index_map, dtype=int)
-    n_rows, n_sessions = cmap.shape if cmap.ndim == 2 else (0, 0)
-    if n_rows == 0 or n_sessions == 0:
-        return np.array([], dtype=float), np.array([], dtype=float)
-
-    dx_all = []
-    dy_all = []
-    for s in range(n_sessions):
-        if s == ref_idx:
-            continue
-        mask = (cmap[:, ref_idx] > 0) & (cmap[:, s] > 0)
-        if not np.any(mask):
-            continue
-        ref_ids = cmap[mask, ref_idx].astype(int) - 1
-        oth_ids = cmap[mask, s].astype(int) - 1
-        ref_c = np.asarray(centroid_locations[ref_idx])[ref_ids]
-        oth_c = np.asarray(centroid_locations[s])[oth_ids]
-        dx_all.append((oth_c[:, 0] - ref_c[:, 0]).astype(float))
-        dy_all.append((oth_c[:, 1] - ref_c[:, 1]).astype(float))
-
-    if len(dx_all) == 0:
-        return np.array([], dtype=float), np.array([], dtype=float)
-
-    return np.concatenate(dx_all), np.concatenate(dy_all)
-
-
-def displacement_quality(dx_px: np.ndarray,
-                         dy_px: np.ndarray,
-                         microns_per_pixel: float,
-                         target_um: float = 2.0) -> Dict[str, float]:
-    """Summarize 'goodness' of a displacement cloud.
-
-    Returns metrics in microns: match_count, median_r_um, frac_within_target, mean_dx_um, mean_dy_um.
-    """
-    dx_px = np.asarray(dx_px, dtype=float).ravel()
-    dy_px = np.asarray(dy_px, dtype=float).ravel()
-    if dx_px.size == 0 or dy_px.size == 0:
-        return dict(match_count=0.0, median_r_um=float('nan'), frac_within_target=float('nan'),
-                    mean_dx_um=float('nan'), mean_dy_um=float('nan'))
-
-    r_px = np.sqrt(dx_px**2 + dy_px**2)
-    r_um = r_px * float(microns_per_pixel)
-
-    target_px = float(target_um) / float(microns_per_pixel)
-    frac = float(np.mean(r_px <= target_px)) if r_px.size else float('nan')
-
-    return dict(
-        match_count=float(r_px.size),
-        median_r_um=float(np.nanmedian(r_um)),
-        frac_within_target=float(frac),
-        mean_dx_um=float(np.nanmean(dx_px) * float(microns_per_pixel)),
-        mean_dy_um=float(np.nanmean(dy_px) * float(microns_per_pixel)),
-    )
-
-
-def neighbor_displacement_quality(data_dist: Dict[str, Any],
-                                  microns_per_pixel: float,
-                                  target_um: float = 2.0) -> Dict[str, float]:
-    """Quality metrics computed from the *neighbor-pair* displacement vectors (Stage 3 inputs)."""
-    dx = np.asarray(data_dist.get('neighbors_x_displacements', []), dtype=float).ravel()
-    dy = np.asarray(data_dist.get('neighbors_y_displacements', []), dtype=float).ravel()
-    return displacement_quality(dx, dy, microns_per_pixel, target_um=target_um)
 # ============================================================================ #
 #                      MEAN IMAGE ALIGNMENT                                    #
 # ============================================================================ #
@@ -1634,15 +1530,14 @@ class CellRegPy:
 
         # field of view, saved as CellReg.mat
         sess_fovs = cellreg_files
-        if bool(getattr(self.config, 'test_run', False)):
-            test_run_type = getattr(self.config, 'test_run_type', 'test random alignment')
-            if test_run_type == 'test random alignment':
+        if self.config.test_run:
+            if self.config.test_run_type == 'test random alignment':
                 # random alignment of 4 sessions
                 print("Random alignment of 4 sessions")
                 import random
                 sess_fovs_temp = random.sample(sess_fovs, 4)
                 sess_fovs = sess_fovs_temp
-            elif test_run_type == 'test difficult alignment':
+            elif self.config.test_run_type == 'test difficult alignment':
                 # grab the first and last 3 sessions
                 print("Difficult alignment of first and last 3 sessions")
                 sess_fovs = [sess_fovs[0],[sess_fovs[-1:-3]]]
@@ -1668,34 +1563,8 @@ class CellRegPy:
             mean_images.append(get_mean_image(plane0_path))
             iscell_list.append(get_iscell(plane0_path))
         
-        # Optional spatial-footprint projection images (used for alignability + 2-stage refinement)
-        footprint_images = None
-        fallback_mode = str(getattr(self.config, 'alignment_fallback_mode', 'two_stage')).strip().lower()
-        if fallback_mode in ('mean_then_footprints', 'footprints', 'two_stage'):
-            print("Building spatial-footprint projection images (iscell-filtered)...")
-            fp_arrays = []
-            for sess in sess_fovs:
-                fp_arrays.append(get_spatial_footprints(sess))
-            fp_arrays, _, _, _, _ = adjust_fov_size(fp_arrays)
-
-            footprint_images = []
-            for fp, iscell in zip(fp_arrays, iscell_list):
-                fp_use = fp
-                try:
-                    mask = np.asarray(iscell).astype(bool).squeeze()
-                    if mask.ndim == 1 and fp.shape[0] == mask.shape[0]:
-                        fp_use = fp[mask]
-                except Exception:
-                    pass
-                footprint_images.append(
-                    make_alignment_image_from_footprints(
-                        fp_use,
-                        pixel_weight_threshold=float(getattr(self.config, 'footprint_projection_threshold', 0.5)),
-                    )
-                )
-
         # Get alignable sessions
-        alignable = self.get_alignable_sessions(mean_images, sess_fovs, footprint_images=footprint_images)
+        alignable = self.get_alignable_sessions(mean_images, sess_fovs)
         
         # Plot alignable sessions graph
         if self.config.figures_visibility == 'on':
@@ -1778,8 +1647,7 @@ class CellRegPy:
     
     def get_alignable_sessions(self,
                                mean_images: List[np.ndarray],
-                               sess_names: List[Path],
-                               footprint_images: Optional[List[np.ndarray]] = None) -> Dict:
+                               sess_names: List[Path]) -> Dict:
         """
         Find sessions that can be aligned based on mean image correlation.
         
@@ -1802,7 +1670,6 @@ class CellRegPy:
             'correlations': [],
             'all_correlations': [], # Store full matrix for debugging
             'transformations': [],
-            'alignment_sources': [],
             'index_aligned': [],
             'not_alignable': []
         }
@@ -1813,41 +1680,36 @@ class CellRegPy:
             
             best_peaks = []
             best_tforms = []
-            best_sources = []
             
             # Compare to all other sessions
             if self.config.use_parallel_processing:
                 # Parallel processing
                 try:
                     with mp.Pool() as pool:
-                        args = [(mean_images, align_i, fov_i, footprint_images) 
+                        args = [(mean_images, align_i, fov_i) 
                                 for fov_i in range(n_sessions)]
                         results = pool.starmap(self._check_alignment, args)
 
-                    best_sources = []
-                    for _, _, peak, tform, source in results:
+                    for _, _, peak, tform in results:
                         best_peaks.append(peak)
                         best_tforms.append(tform)
-                        best_sources.append(source)
                 except Exception as e:
                     print(f"    [WARN] multiprocessing failed ({e}); falling back to serial")
                     for fov_i in range(n_sessions):
                         print(f"    Comparing to session {fov_i + 1}/{n_sessions}")
-                        _, _, peak, tform, source = self._check_alignment(mean_images, align_i, fov_i, footprint_images)
+                        _, _, peak, tform = self._check_alignment(mean_images, align_i, fov_i)
                         best_peaks.append(peak)
                         best_tforms.append(tform)
-                        best_sources.append(source)
 
             else:
                 # Serial processing
                 for fov_i in range(n_sessions):
                     print(f"    Comparing to session {fov_i + 1}/{n_sessions}")
-                    _, _, peak, tform, source = self._check_alignment(
-                        mean_images, align_i, fov_i, footprint_images
+                    _, _, peak, tform = self._check_alignment(
+                        mean_images, align_i, fov_i
                     )
                     best_peaks.append(peak)
                     best_tforms.append(tform)
-                    best_sources.append(source)
             
             best_peaks = np.array(best_peaks)
             
@@ -1860,7 +1722,6 @@ class CellRegPy:
             alignable['correlations'].append(best_peaks[idx_align])
             alignable['all_correlations'].append(best_peaks) # Store all
             alignable['transformations'].append([best_tforms[i] for i in idx_align])
-            alignable['alignment_sources'].append([best_sources[i] for i in idx_align])
             alignable['index_aligned'].append(idx_align)
             alignable['not_alignable'].append(
                 np.where(best_peaks <= thr)[0]
@@ -2002,177 +1863,19 @@ class CellRegPy:
                     title=f"NOT ALIGNABLE: {short_ref} vs Sess {target_idx+1}"
                 )
     
-    def _alignment_needs_fallback(self, peak: float) -> bool:
-        """Return True when the primary alignment score is not usable."""
-        try:
-            peak_f = float(peak)
-        except Exception:
-            return True
-        if not np.isfinite(peak_f):
-            return True
-        return peak_f < float(self.config.alignable_threshold)
-
-    def _align_with_optional_fallback(self,
-                                          fixed_img: np.ndarray,
-                                          moving_img: np.ndarray,
-                                          *,
-                                          fixed_fp_img: Optional[np.ndarray] = None,
-                                          moving_fp_img: Optional[np.ndarray] = None,
-                                          plot_fig: bool = False):
-        """Mean-image alignment with optional footprint alignment.
-
-        Modes (cfg.alignment_fallback_mode):
-            - 'two_stage' (default): mean-image alignment first, then refine using
-              spatial-footprint projection alignment (iscell-filtered).
-            - 'mean_then_footprints': only try footprint alignment if mean-image
-              alignment is below threshold.
-            - 'footprints': footprint alignment only.
-            - 'none': mean-image alignment only.
-
-        Returns:
-            registered, method, peak, tform, filter_name, outliers, source
-        """
-        cfg = self.config
-        mode = str(getattr(cfg, 'alignment_fallback_mode', 'two_stage')).strip().lower()
-
-        from skimage import transform as sktransform
-
-        # ------------------------- Stage 1: mean images -------------------------
-        reg1, method1, peak1, tform1, filt1, out1 = self.aligner.align(
-            fixed_img,
-            moving_img,
-            filter_mode=getattr(cfg, 'filter_mode', 'highpass'),
-            outlier_mode=getattr(cfg, 'outlier_mode', 'off'),
-            plot_fig=plot_fig,
-        )
-
-        # Early exits
-        if mode in ('none', 'mean'):
-            return reg1, method1, peak1, tform1, filt1, out1, 'mean_image'
-        if mode == 'mean_then_footprints' and (not self._alignment_needs_fallback(peak1)):
-            return reg1, method1, peak1, tform1, filt1, out1, 'mean_image'
-
-        # ------------------------- Footprint-only mode -------------------------
-        if mode == 'footprints':
-            if fixed_fp_img is None or moving_fp_img is None:
-                raise ValueError("cfg.alignment_fallback_mode='footprints' but footprint images were not provided.")
-            reg2, method2, peak2, tform2, filt2, out2 = self.aligner.align(
-                fixed_fp_img,
-                moving_fp_img,
-                filter_mode=getattr(cfg, 'footprint_filter_mode', 'highpass'),
-                outlier_mode=getattr(cfg, 'footprint_outlier_mode', 'off'),
-                plot_fig=plot_fig,
-            )
-            return reg2, f"fp:{method2}", peak2, tform2, filt2, out2, 'spatial_footprints'
-
-        # ------------------------- Stage 2: footprints -------------------------
-        if fixed_fp_img is None or moving_fp_img is None:
-            # Can't do stage 2
-            return reg1, method1, peak1, tform1, filt1, out1, 'mean_image'
-
-        # Pre-warp moving footprints with stage-1 transform for refinement
-        moving_fp_for_stage2 = moving_fp_img
-        tform1_ok = (tform1 is not None)
-        if tform1_ok:
-            try:
-                moving_fp_for_stage2 = sktransform.warp(
-                    np.asarray(moving_fp_img, dtype=float),
-                    tform1.inverse,
-                    output_shape=np.asarray(fixed_fp_img).shape,
-                    order=1,
-                    preserve_range=True,
-                    mode='constant',
-                    cval=0.0,
-                )
-            except Exception:
-                # If pre-warp fails, just align raw footprint projections
-                moving_fp_for_stage2 = moving_fp_img
-                tform1_ok = False
-
-        reg2, method2, peak2, tform2, filt2, out2 = self.aligner.align(
-            fixed_fp_img,
-            moving_fp_for_stage2,
-            filter_mode=getattr(cfg, 'footprint_filter_mode', 'highpass'),
-            outlier_mode=getattr(cfg, 'footprint_outlier_mode', 'off'),
-            plot_fig=plot_fig,
-        )
-
-        # Compose transforms: T = T2 ∘ T1
-        t_final = tform1
-        if tform2 is not None:
-            try:
-                if tform1_ok:
-                    mat = np.asarray(tform2.params) @ np.asarray(tform1.params)
-                else:
-                    mat = np.asarray(tform2.params)
-                t_final = sktransform.AffineTransform(matrix=mat)
-            except Exception:
-                # Fallback: use stage-2 transform if composition fails
-                t_final = tform2
-
-        # Decide whether to accept footprint refinement.
-        # Default: accept if the footprint-stage score is finite and >= the mean-image score,
-        # or if the mean-image score is unusable (NaN / -inf).
-        try:
-            peak1_f = float(peak1)
-        except Exception:
-            peak1_f = float('nan')
-        try:
-            peak2_f = float(peak2)
-        except Exception:
-            peak2_f = float('nan')
-
-        peak2_ok = np.isfinite(peak2_f) and (peak2_f != -np.inf)
-        peak1_ok = np.isfinite(peak1_f) and (peak1_f != -np.inf)
-
-        accept_refine = peak2_ok and ((not peak1_ok) or (peak2_f >= peak1_f))
-
-        if accept_refine:
-            # For gating/alignability, report the *best* score we observed.
-            peak_final = peak2_f
-            if peak1_ok:
-                peak_final = max(peak_final, peak1_f)
-            method = f"mean:{method1}->fp:{method2}"
-            filt = f"{filt1}->{filt2}"
-            outliers = (out1, out2)
-            source = 'mean_then_footprints'
-            reg = reg2
-        else:
-            peak_final = peak1_f
-            t_final = tform1
-            method = f"mean:{method1} (fp_refine_rejected:{method2})"
-            filt = filt1
-            outliers = out1
-            source = 'mean_image'
-            reg = reg1
-
-        # Preserve original behavior when peaks are not finite
-        peak_return = peak_final
-        if not np.isfinite(peak_return) or peak_return == -np.inf:
-            peak_return = peak1
-
-        return reg, method, peak_return, t_final, filt, outliers, source
-
     def _check_alignment(self, 
                         mean_images: List[np.ndarray],
                         ref_idx: int,
-                        mov_idx: int,
-                        footprint_images: Optional[List[np.ndarray]] = None) -> Tuple[np.ndarray, str, float, Any, str]:
-        """Check alignment between two sessions, with optional footprint-projection fallback."""
-        fixed_fp = None
-        moving_fp = None
-        if footprint_images is not None:
-            fixed_fp = footprint_images[ref_idx]
-            moving_fp = footprint_images[mov_idx]
-
-        _, method, peak, tform, _, _, source = self._align_with_optional_fallback(
+                        mov_idx: int) -> Tuple[np.ndarray, str, float, Any]:
+        """Check alignment between two sessions."""
+        _, method, peak, tform, _, _ = self.aligner.align(
             mean_images[ref_idx],
             mean_images[mov_idx],
-            fixed_fp_img=fixed_fp,
-            moving_fp_img=moving_fp,
-            plot_fig=False,
+            filter_mode='highpass',
+            outlier_mode='off',
+            plot_fig=False
         )
-        return None, method, peak, tform, source
+        return None, method, peak, tform
     
     def _remove_redundancies(self, alignable: Dict) -> Dict:
         """
@@ -2284,21 +1987,6 @@ class CellRegPy:
         
         # Step 2c: Compute projections and centroids
         footprint_projections = compute_footprint_projections(adjusted_fps)
-        footprint_alignment_images = []
-        for fp, iscell in zip(adjusted_fps, iscell_list):
-            fp_use = fp
-            try:
-                mask = np.asarray(iscell).astype(bool).squeeze()
-                if mask.ndim == 1 and fp.shape[0] == mask.shape[0]:
-                    fp_use = fp[mask]
-            except Exception:
-                pass
-            footprint_alignment_images.append(
-                make_alignment_image_from_footprints(
-                    fp_use,
-                    pixel_weight_threshold=float(getattr(cfg, 'footprint_projection_threshold', 0.5)),
-                )
-            )
         centroid_locations = compute_centroids(adjusted_fps, cfg.microns_per_pixel)
         centroid_projections = compute_centroid_projections(centroid_locations, adjusted_fps)
         
@@ -2318,28 +2006,6 @@ class CellRegPy:
         # Book-keeping for validation plots
         alignment_translations = np.zeros((3, n_sessions), dtype=float)  # [dx; dy; rot_deg]
         maximal_cross_correlation = np.full(n_sessions, np.nan, dtype=float)
-        alignment_sources = np.array(['reference'] * n_sessions, dtype=object)
-        
-        # Mean-image correlation diagnostics (raw vs aligned)
-        def _safe_flat_corr(a, b) -> float:
-            try:
-                aa = np.asarray(a, dtype=float).ravel()
-                bb = np.asarray(b, dtype=float).ravel()
-                if aa.size == 0 or bb.size == 0 or aa.size != bb.size:
-                    return float('nan')
-                aa = aa - np.nanmean(aa)
-                bb = bb - np.nanmean(bb)
-                denom = float(np.linalg.norm(aa) * np.linalg.norm(bb))
-                if denom == 0.0 or (not np.isfinite(denom)):
-                    return float('nan')
-                return float(np.dot(aa, bb) / denom)
-            except Exception:
-                return float('nan')
-        
-        raw_image_correlation = np.full(n_sessions, np.nan, dtype=float)
-        aligned_image_correlation = np.full(n_sessions, np.nan, dtype=float)
-        raw_image_correlation[ref_idx] = 1.0
-        aligned_image_correlation[ref_idx] = 1.0
 
         from skimage import transform as sktransform
 
@@ -2350,17 +2016,13 @@ class CellRegPy:
                 maximal_cross_correlation[i] = 1.0
                 continue
 
-            # Correlation before alignment (mean images)
-            raw_image_correlation[i] = _safe_flat_corr(fov_mean_images[ref_idx], fov_mean_images[i])
-
             # Get transformation from mean image alignment
-            _, method, peak, tform, _, _, alignment_source = self._align_with_optional_fallback(
+            _, method, peak, tform, _, _ = self.aligner.align(
                 fov_mean_images[ref_idx],
                 fov_mean_images[i],
-                fixed_fp_img=footprint_alignment_images[ref_idx],
-                moving_fp_img=footprint_alignment_images[i],
+                filter_mode=getattr(cfg, "filter_mode", "highpass"),
+                outlier_mode=getattr(cfg, "outlier_mode", "off"),
             )
-            alignment_sources[i] = alignment_source
 
             # Normalize peak into a safe float for downstream plots
             try:
@@ -2370,21 +2032,6 @@ class CellRegPy:
             if not np.isfinite(peak_f) or peak_f == -np.inf:
                 peak_f = float("nan")
             maximal_cross_correlation[i] = peak_f
-
-            # Correlation after applying the selected transform to the mean image
-            if tform is not None:
-                try:
-                    reg_mean = sktransform.warp(
-                        np.asarray(fov_mean_images[i], dtype=float),
-                        tform.inverse,
-                        output_shape=np.asarray(fov_mean_images[ref_idx]).shape,
-                        order=1, preserve_range=True, mode='constant', cval=0.0,
-                    )
-                    aligned_image_correlation[i] = _safe_flat_corr(fov_mean_images[ref_idx], reg_mean)
-                except Exception:
-                    aligned_image_correlation[i] = raw_image_correlation[i]
-            else:
-                aligned_image_correlation[i] = raw_image_correlation[i]
 
             if tform is not None and np.isfinite(peak_f) and peak_f >= float(cfg.alignable_threshold):
                 # Extract rigid-ish params for reporting (dx, dy, rot)
@@ -2418,7 +2065,7 @@ class CellRegPy:
                     aligned_centroid_locations[i] = cents
 
                 print(
-                    f"    Session {i+1}: source={alignment_source}, method={method}, peak={peak_f:.3f}, "
+                    f"    Session {i+1}: method={method}, peak={peak_f:.3f}, "
                     f"dx={alignment_translations[0,i]:.1f}, dy={alignment_translations[1,i]:.1f}, "
                     f"rot={alignment_translations[2,i]:.2f}°"
                 )
@@ -2426,465 +2073,235 @@ class CellRegPy:
                 # Below threshold (or no transform) – keep as-is
                 aligned_fps[i] = adjusted_fps[i]
                 aligned_centroid_locations[i] = centroid_locations[i]
-                print(f"    Session {i+1}: source={alignment_source}, method={method}, peak={peak_f:.3f} (below threshold)")
+                print(f"    Session {i+1}: method={method}, peak={peak_f:.3f} (below threshold)")
 
-        # ------------------------------------------------------------------
-        # Peak-gated SIMPLE registration (IoU + Hungarian).
-        #
-        # When the mean-image alignment peak score is extremely high, CellReg's
-        # probabilistic mixture modeling (and especially the neighbor displacement
-        # cloud) can become misleading because there are many "wrong but nearby"
-        # ROI pairs in dense FOVs. In this regime we skip CellReg modeling
-        # entirely and do deterministic IoU+Hungarian registration on iscell ROIs.
-        #
-        # NOTE: This block intentionally does NOT sweep / change cfg.maximal_distance.
-        # ------------------------------------------------------------------
-        use_flex = False
-        skip_probabilistic = False
-        flex_debug = {}
-        simple_candidate = None
-        max_dist_px = None
-        data_dist = None
+        # Step 3: Compute data distribution
 
-        # Peak score computed by MeanImageAligner (maximal_cross_correlation per session)
-        peak_mask = np.ones(n_sessions, dtype=bool)
-        peak_mask[ref_idx] = False
-        peak_med = np.nanmedian(maximal_cross_correlation[peak_mask]) if peak_mask.any() else float('nan')
-        peak_thr = float(getattr(cfg, 'auto_flex_peak_threshold', 0.95))
-
-        if bool(getattr(cfg, 'auto_flex_on_high_peak', False)) and np.isfinite(peak_med) and (peak_med >= peak_thr):
-            use_flex = True
-            skip_probabilistic = True
-            print(f"  🧠 High alignment peak detected (median peak={peak_med:.3f} ≥ {peak_thr:.3f}).")
-            print("  Switching to SIMPLE IoU+Hungarian registration (peak-gated; skipping CellReg modeling).")
-
-            # Build iscell-filtered arrays (operate only on true cells)
-            idx_maps = []
-            fps_cells = []
-            cents_cells = []
-            for fp, cents, iscell in zip(aligned_fps, aligned_centroid_locations, iscell_list):
-                mask = np.asarray(iscell).astype(bool).squeeze()
-                if (mask.ndim == 1) and (fp.shape[0] == mask.shape[0]):
-                    idx = np.where(mask)[0]
-                    idx_maps.append(idx)
-                    fps_cells.append(fp[mask])
-                    cents_cells.append(cents[mask])
-                else:
-                    idx_maps.append(np.arange(fp.shape[0]))
-                    fps_cells.append(fp)
-                    cents_cells.append(cents)
-
-            # IMPORTANT: do NOT change the user's maximal_distance; convert µm->px here.
-            max_dist_px_simple = float(cfg.maximal_distance) / float(cfg.microns_per_pixel)
-
-            cmap_c, cdist_c, iou_c, reg_d_c, nonreg_d_c = initial_registration_iou_hungarian(
-                fps_cells,
-                cents_cells,
-                reference_session_index=ref_idx,
-                maximal_distance=max_dist_px_simple,
-                mask_threshold=float(getattr(cfg, 'simple_mask_threshold', 0.15)),
-                iou_threshold=float(getattr(cfg, 'simple_iou_threshold', 0.10)),
-                cost_beta=float(getattr(cfg, 'simple_cost_beta', 0.25)),
-            )
-
-            # Remap cell-only indices back to original ROI indices (suite2p indexing space, 1-indexed)
-            cmap_full = np.asarray(cmap_c, dtype=int).copy()
-            for s, idx in enumerate(idx_maps):
-                nz = cmap_full[:, s] > 0
-                if np.any(nz):
-                    cmap_full[nz, s] = (idx[cmap_full[nz, s] - 1] + 1).astype(int)
-
-            # Set outputs as FINAL
-            cell_to_index_map = cmap_full
-            centroid_distance_map = np.asarray(cdist_c, dtype=float)
-            spatial_correlation_map = np.asarray(iou_c, dtype=float)  # reuse slot for IoU map
-            registered_distances = np.asarray(reg_d_c, dtype=float)
-            non_registered_distances = np.asarray(nonreg_d_c, dtype=float)
-            registered_correlations = np.array([], dtype=float)
-            non_registered_correlations = np.array([], dtype=float)
-
-            # Minimal placeholders so the rest of the pipeline (saving + tables + figures) remains stable
-            model_used = "Simple IoU+Hungarian (peak-gated)"
-            initial_metric_threshold = float(getattr(cfg, 'simple_iou_threshold', 0.10))
-            best_model_string = model_used
-            # Ensure downstream saving never crashes (probabilistic fields are absent in simple mode)
-            p_same_models = dict(
-                simple_mode=True,
-                method="iou_hungarian",
-                peak_median=float(peak_med) if np.isfinite(peak_med) else float('nan'),
-                peak_threshold=float(peak_thr),
-                maximal_distance_um=float(getattr(cfg, 'maximal_distance', float('nan'))),
-                microns_per_pixel=float(getattr(cfg, 'microns_per_pixel', float('nan'))),
-                mask_threshold=float(getattr(cfg, 'simple_mask_threshold', 0.15)),
-                iou_threshold=float(getattr(cfg, 'simple_iou_threshold', 0.10)),
-                cost_beta=float(getattr(cfg, 'simple_cost_beta', 0.25)),
-            )
-            number_of_bins = 50
+        print("  Computing cell-pair similarity distributions...")
+        max_dist_px = cfg.maximal_distance / cfg.microns_per_pixel
+        
+        data_dist = compute_data_distribution(
+            aligned_fps,
+            aligned_centroid_locations,
+            max_dist_px
+        )
+        
+        # Step 4b: Probabilistic modeling and clustering (MATLAB CellReg-style)
+        p_same_models = {}
+        if cfg.registration_approach.strip().lower().startswith("prob"):
+            # Bin centers (distance in pixels, correlation in [0,1])
+            number_of_bins, _ = estimate_num_bins(aligned_fps, max_dist_px)
             centers_of_bins = (
-                np.linspace(0, max_dist_px_simple, number_of_bins, dtype=np.float64),
+                np.linspace(0, max_dist_px, number_of_bins, dtype=np.float64),
                 np.linspace(0, 1, number_of_bins, dtype=np.float64),
             )
-            centroid_overlap_mse = float("nan")
-            corr_overlap_mse = float("nan")
-            centroid_intersection = float("nan")
-            corr_intersection = float("nan")
-            centroid_best_model = ""
-            corr_best_model = ""
-            centroid_same_model = np.array([])
-            centroid_diff_model = np.array([])
-            centroid_mixture_model = np.array([])
-            corr_same_model = np.array([])
-            corr_diff_model = np.array([])
-            corr_mixture_model = np.array([])
-            p_same_given_centroid_distance = np.array([])
-            p_same_given_spatial_correlation = np.array([])
-            p_same_centroid_distances = []
-            p_same_spatial_correlations = []
-            all_to_all_p_same = []
-            registered_cells_centroids = None
-            cluster_scores = {}
-            pre_spatial_floor_map = cell_to_index_map.copy()
-            n_vetoed_clusters = 0
-            vetoed_centroid_um = []
-            vetoed_spatial_corr = []
-            p_same_vec = np.array([])
-            p_different_vec = np.array([])
-            accuracy_scores = np.array([np.nan, np.nan, np.nan], dtype=float)
 
-            # Provide a simple_candidate dict so Stage 7 QC plots are produced (even though it's FINAL here)
-            try:
-                dx_f, dy_f = compute_registered_pair_displacements(cell_to_index_map, aligned_centroid_locations, ref_idx)
-                q_f = displacement_quality(dx_f, dy_f, cfg.microns_per_pixel, target_um=2.0)
-            except Exception:
-                q_f = {}
-
-            simple_candidate = dict(
-                cell_to_index_map=cell_to_index_map,
-                quality=q_f,
+            # Fit mixture models from neighbor distributions
+            (p_same_given_centroid_distance,
+             centroid_same_model,
+             centroid_diff_model,
+             centroid_mixture_model,
+             centroid_intersection,
+             centroid_best_model,
+             centroid_overlap_mse) = compute_centroid_distances_model_custom(
+                data_dist["neighbors_centroid_distances"], number_of_bins, centers_of_bins, 
+                microns_per_pixel=cfg.microns_per_pixel
             )
 
-            flex_debug = dict(
-                peak_med=float(peak_med),
-                peak_thr=float(peak_thr),
-                method="iou_hungarian",
-                max_dist_um=float(cfg.maximal_distance),
-                max_dist_px=float(max_dist_px_simple),
-                quality=q_f,
+            (p_same_given_spatial_correlation,
+             corr_same_model,
+             corr_diff_model,
+             corr_mixture_model,
+             corr_intersection,
+             corr_best_model,
+             corr_overlap_mse) = compute_spatial_correlations_model(
+                data_dist["neighbors_spatial_correlations"], number_of_bins, centers_of_bins
             )
 
-        # (Continue with the standard probabilistic CellReg workflow below.)
-        # (Continue with the standard probabilistic CellReg workflow below.)
+            # Convert all-to-all values into all-to-all p_same lookups
+            p_same_centroid_distances, p_same_spatial_correlations = compute_p_same(
+                data_dist["all_to_all_centroid_distances"],
+                data_dist["all_to_all_spatial_correlations"],
+                centers_of_bins,
+                p_same_given_centroid_distance,
+                p_same_given_spatial_correlation,
+            )
 
-        if not skip_probabilistic:
-
-            # Step 3: Compute data distribution
-
-            if max_dist_px is None:
-                max_dist_px = cfg.maximal_distance / cfg.microns_per_pixel
-
-            if data_dist is None:
-                print("  Computing cell-pair similarity distributions...")
-                data_dist = compute_data_distribution(
-                    aligned_fps,
-                    aligned_centroid_locations,
-                    max_dist_px
-                )
-            else:
-                print(f"  Using precomputed similarity distributions (max_dist_px={float(max_dist_px):.3f}).")
-
-        
-            # Step 4b: Probabilistic modeling and clustering (MATLAB CellReg-style)
-            p_same_models = {}
-            if cfg.registration_approach.strip().lower().startswith("prob"):
-                # Bin centers (distance in pixels, correlation in [0,1])
-                number_of_bins, _ = estimate_num_bins(aligned_fps, max_dist_px)
-                centers_of_bins = (
-                    np.linspace(0, max_dist_px, number_of_bins, dtype=np.float64),
-                    np.linspace(0, 1, number_of_bins, dtype=np.float64),
-                )
-
-                # Fit mixture models from neighbor distributions
-                (p_same_given_centroid_distance,
-                 centroid_same_model,
-                 centroid_diff_model,
-                 centroid_mixture_model,
-                 centroid_intersection,
-                 centroid_best_model,
-                 centroid_overlap_mse) = compute_centroid_distances_model_custom(
-                    data_dist["neighbors_centroid_distances"], number_of_bins, centers_of_bins, 
-                    microns_per_pixel=cfg.microns_per_pixel
-                )
-
-                (p_same_given_spatial_correlation,
-                 corr_same_model,
-                 corr_diff_model,
-                 corr_mixture_model,
-                 corr_intersection,
-                 corr_best_model,
-                 corr_overlap_mse) = compute_spatial_correlations_model(
-                    data_dist["neighbors_spatial_correlations"], number_of_bins, centers_of_bins
-                )
-
-                # Convert all-to-all values into all-to-all p_same lookups
-                p_same_centroid_distances, p_same_spatial_correlations = compute_p_same(
-                    data_dist["all_to_all_centroid_distances"],
-                    data_dist["all_to_all_spatial_correlations"],
-                    centers_of_bins,
-                    p_same_given_centroid_distance,
-                    p_same_given_spatial_correlation,
-                )
-
-                # Choose which probabilistic model to use for clustering
+            # Choose which probabilistic model to use for clustering
             
-                raw_model_type = str(cfg.model_type).strip()
+            raw_model_type = str(cfg.model_type).strip()
 
-                # Always compute best_model_string for reporting, but optionally override
-                # the *final* registration to use the dual-model approach (Stage 6).
+            # Always compute best_model_string for reporting, but optionally override
+            # the *final* registration to use the dual-model approach (Stage 6).
 
-                if raw_model_type.lower() in ('auto', 'best', 'matlab'):
-                    best_model_string = choose_best_model(
-                        centroid_overlap_mse,
-                        corr_overlap_mse,
-                        centroid_intersection=centroid_intersection,
-                        corr_intersection=corr_intersection,
-                        prefer='Spatial correlation',
-                    )
-                else:
-                    if raw_model_type.lower().startswith('centroid'):
-                        best_model_string = 'Centroid distance'
-                    elif raw_model_type.lower().startswith('spatial') or raw_model_type.lower().startswith('corr'):
-                        best_model_string = 'Spatial correlation'
-                    else:
-                        raise ValueError(f"Unknown model_type: {cfg.model_type!r}. Use 'auto', 'Spatial correlation', or 'Centroid distance'.")
-
-                # If model_type is auto and the two models are a near-tie by overlap MSE,
-                # enable dual-model (centroid-primary clustering + spatial-correlation veto) for robustness.
-                if raw_model_type.lower() in ('auto', 'best', 'matlab') and bool(getattr(cfg, 'dual_on_model_tie', True)):
-                    try:
-                        c_mse = float(centroid_overlap_mse)
-                        r_mse = float(corr_overlap_mse)
-                        denom = max(1e-12, min(c_mse, r_mse))
-                        tie_rel_tol = float(getattr(cfg, 'model_tie_rel_tol', 0.01))
-                        is_tie = (np.isfinite(c_mse) and np.isfinite(r_mse) and (abs(c_mse - r_mse) <= tie_rel_tol * denom))
-                    except Exception:
-                        is_tie = False
-                    if is_tie:
-                        use_dual_model = True
-                        print(f"  ⚖ Model MSE tie detected (centroid_mse={c_mse:.4g}, corr_mse={r_mse:.4g}); "
-                              "enabling dual-model (centroid primary + corr veto).")
-
-                # Dual-model override: force centroid-primary clustering, then apply spatial floor veto
-                model_used = 'Centroid distance' if use_dual_model else best_model_string
-
-                if model_used == 'Centroid distance':
-                    all_to_all_p_same = p_same_centroid_distances
-                    # NOTE: centroid_intersection is in µm; initial registration expects pixels
-                    initial_metric_threshold = (float(centroid_intersection) / float(cfg.microns_per_pixel)) if np.isfinite(centroid_intersection) else max_dist_px
-                else:
-                    all_to_all_p_same = p_same_spatial_correlations
-                    initial_metric_threshold = corr_intersection if np.isfinite(corr_intersection) else cfg.sufficient_correlation_footprints
-
-            # Step 4: Initial registration (MATLAB: initial_registration_type = best_model_string)
-            if model_used == "Centroid distance":
-                (cell_to_index_map,
-                 registered_distances,
-                 non_registered_distances,
-                 centroid_distance_map) = initial_registration_centroid_distances_custom(
-                    aligned_centroid_locations,
-                    maximal_distance=max_dist_px,
-                    centroid_distance_threshold=initial_metric_threshold,
+            if raw_model_type.lower() in ('auto', 'best', 'matlab'):
+                best_model_string = choose_best_model(
+                    centroid_overlap_mse,
+                    corr_overlap_mse,
+                    centroid_intersection=centroid_intersection,
+                    corr_intersection=corr_intersection,
+                    prefer='Spatial correlation',
                 )
-                registered_correlations = np.array([])
-                non_registered_correlations = np.array([])
-                spatial_correlation_map = np.zeros_like(centroid_distance_map)
             else:
-                (cell_to_index_map,
-                 registered_correlations,
-                 non_registered_correlations,
-                 spatial_correlation_map) = initial_registration_spatial_corr(
-                    aligned_fps,
-                    aligned_centroid_locations,
-                    maximal_distance=max_dist_px,
-                    spatial_correlation_threshold=initial_metric_threshold,
-                )
-                centroid_distance_map = np.zeros_like(spatial_correlation_map)
-                registered_distances = np.array([])
-                non_registered_distances = np.array([])
+                if raw_model_type.lower().startswith('centroid'):
+                    best_model_string = 'Centroid distance'
+                elif raw_model_type.lower().startswith('spatial') or raw_model_type.lower().startswith('corr'):
+                    best_model_string = 'Spatial correlation'
+                else:
+                    raise ValueError(f"Unknown model_type: {cfg.model_type!r}. Use 'auto', 'Spatial correlation', or 'Centroid distance'.")
 
-            # Step 5: Cluster / refine mapping (MATLAB Stage 5)
-            # We always cluster using the selected model_used. For the dual-model approach,
-            # model_used is forced to 'Centroid distance' (centroid-primary).
-            centroid_primary_map, registered_cells_centroids, cluster_scores = cluster_cells_matlab(
-                cell_to_index_map,
-                all_to_all_p_same,
-                data_dist["all_to_all_indexes"],
-                max_dist_px,
-                cfg.p_same_threshold,
+            # Dual-model override: force centroid-primary clustering, then apply spatial floor veto
+            model_used = 'Centroid distance' if use_dual_model else best_model_string
+
+            if model_used == 'Centroid distance':
+                all_to_all_p_same = p_same_centroid_distances
+                # NOTE: centroid_intersection is in µm; initial registration expects pixels
+                initial_metric_threshold = (float(centroid_intersection) / float(cfg.microns_per_pixel)) if np.isfinite(centroid_intersection) else max_dist_px
+            else:
+                all_to_all_p_same = p_same_spatial_correlations
+                initial_metric_threshold = corr_intersection if np.isfinite(corr_intersection) else cfg.sufficient_correlation_footprints
+
+        # Step 4: Initial registration (MATLAB: initial_registration_type = best_model_string)
+        if model_used == "Centroid distance":
+            (cell_to_index_map,
+             registered_distances,
+             non_registered_distances,
+             centroid_distance_map) = initial_registration_centroid_distances_custom(
                 aligned_centroid_locations,
-                registration_approach="Probabilistic",
-                transform_data=False,
-                verbose=True
+                maximal_distance=max_dist_px,
+                centroid_distance_threshold=initial_metric_threshold,
             )
-
-            # Step 6 (dual-model): spatial floor veto (centroid-primary + spatial-corr cutoff)
-            pre_spatial_floor_map = centroid_primary_map.copy()
-            n_vetoed_clusters = 0
-            vetoed_centroid_um = []
-            vetoed_spatial_corr = []
-
-            if use_dual_model:
-                filtered_map = pre_spatial_floor_map.copy()
-                for cluster_idx in range(filtered_map.shape[0]):
-                    row = filtered_map[cluster_idx, :]
-                    present_sessions = np.where(row > 0)[0]
-                    if present_sessions.size < 2:
-                        continue
-                    veto = False
-                    # check all within-cluster session pairs
-                    for ii in range(present_sessions.size):
-                        if veto: break
-                        si = int(present_sessions[ii])
-                        ci = int(row[si]) - 1
-                        for jj in range(ii + 1, present_sessions.size):
-                            sj = int(present_sessions[jj])
-                            cj = int(row[sj]) - 1
-                            fp_i = aligned_fps[si][ci]
-                            fp_j = aligned_fps[sj][cj]
-                            sc = compute_spatial_correlation(fp_i, fp_j)
-                            if sc < spatial_corr_floor:
-                                # record the failing pair for histograms
-                                di = aligned_centroid_locations[si][ci]
-                                dj = aligned_centroid_locations[sj][cj]
-                                dpx = float(np.sqrt(np.sum((di - dj) ** 2)))
-                                vetoed_centroid_um.append(dpx * float(cfg.microns_per_pixel))
-                                vetoed_spatial_corr.append(float(sc))
-                                veto = True
-                                break
-                    if veto:
-                        # dissolve this multi-session cluster into singletons (keep first session only)
-                        for s_idx in present_sessions[1:]:
-                            filtered_map[cluster_idx, int(s_idx)] = 0
-                        n_vetoed_clusters += 1
-
-                cell_to_index_map = filtered_map
-            else:
-                cell_to_index_map = centroid_primary_map
-
-            # Recompute probabilistic accuracy on FINAL map (post-veto if dual_model enabled)
-            p_same_vec, p_different_vec, accuracy_scores = estimate_registration_accuracy(
-                cell_to_index_map,
-                all_to_all_p_same,
-                data_dist["all_to_all_indexes"],
-                threshold=cfg.p_same_threshold,
+            registered_correlations = np.array([])
+            non_registered_correlations = np.array([])
+            spatial_correlation_map = np.zeros_like(centroid_distance_map)
+        else:
+            (cell_to_index_map,
+             registered_correlations,
+             non_registered_correlations,
+             spatial_correlation_map) = initial_registration_spatial_corr(
+                aligned_fps,
+                aligned_centroid_locations,
+                maximal_distance=max_dist_px,
+                spatial_correlation_threshold=initial_metric_threshold,
             )
+            centroid_distance_map = np.zeros_like(spatial_correlation_map)
+            registered_distances = np.array([])
+            non_registered_distances = np.array([])
 
-            # Recompute cluster score distributions on FINAL map (so any downstream plots match the dual output)
-            try:
-                scores_out = compute_scores_matlab(
-                    cell_to_index_map, data_dist["all_to_all_indexes"], all_to_all_p_same, n_sessions
-                )
-                cluster_scores = dict(
-                    cell_scores=scores_out[0],
-                    cell_scores_positive=scores_out[1],
-                    cell_scores_negative=scores_out[2],
-                    cell_scores_exclusive=scores_out[3],
-                    p_same_registered_pairs=scores_out[4],
-                )
-            except Exception:
-                pass
+        # Step 5: Cluster / refine mapping (MATLAB Stage 5)
+        # We always cluster using the selected model_used. For the dual-model approach,
+        # model_used is forced to 'Centroid distance' (centroid-primary).
+        centroid_primary_map, registered_cells_centroids, cluster_scores = cluster_cells_matlab(
+            cell_to_index_map,
+            all_to_all_p_same,
+            data_dist["all_to_all_indexes"],
+            max_dist_px,
+            cfg.p_same_threshold,
+            aligned_centroid_locations,
+            registration_approach="Probabilistic",
+            transform_data=False,
+            verbose=True
+        )
 
-            p_same_models = dict(
-                model_used=model_used,
-                best_model_string=best_model_string if 'best_model_string' in locals() else model_used,
-                dual_model=use_dual_model,
-                spatial_corr_floor=spatial_corr_floor,
-                n_vetoed_clusters=int(n_vetoed_clusters) if 'n_vetoed_clusters' in locals() else 0,
-                number_of_bins=number_of_bins,
-                centers_of_bins=centers_of_bins,
-                p_same_threshold=cfg.p_same_threshold,
-                # Centroid-distance model
-                p_same_given_centroid_distance=p_same_given_centroid_distance,
-                centroid_same_model=centroid_same_model,
-                centroid_different_model=centroid_diff_model,
-                centroid_mixture_model=centroid_mixture_model,
-                centroid_intersection=centroid_intersection,
-                centroid_best_model=centroid_best_model,
-                centroid_overlap_mse=centroid_overlap_mse,
-                # Spatial-correlation model
-                p_same_given_spatial_correlation=p_same_given_spatial_correlation,
-                spatial_same_model=corr_same_model,
-                spatial_different_model=corr_diff_model,
-                spatial_mixture_model=corr_mixture_model,
-                spatial_intersection=corr_intersection,
-                spatial_best_model=corr_best_model,
-                spatial_overlap_mse=corr_overlap_mse,
-                # Clustering outputs
-                registered_cells_centroids=registered_cells_centroids,
-                cluster_scores=cluster_scores,
-                p_same_vec=p_same_vec,
-                p_different_vec=p_different_vec,
-                accuracy_scores=accuracy_scores,
+        # Step 6 (dual-model): spatial floor veto (centroid-primary + spatial-corr cutoff)
+        pre_spatial_floor_map = centroid_primary_map.copy()
+        n_vetoed_clusters = 0
+        vetoed_centroid_um = []
+        vetoed_spatial_corr = []
+
+        if use_dual_model:
+            filtered_map = pre_spatial_floor_map.copy()
+            for cluster_idx in range(filtered_map.shape[0]):
+                row = filtered_map[cluster_idx, :]
+                present_sessions = np.where(row > 0)[0]
+                if present_sessions.size < 2:
+                    continue
+                veto = False
+                # check all within-cluster session pairs
+                for ii in range(present_sessions.size):
+                    if veto: break
+                    si = int(present_sessions[ii])
+                    ci = int(row[si]) - 1
+                    for jj in range(ii + 1, present_sessions.size):
+                        sj = int(present_sessions[jj])
+                        cj = int(row[sj]) - 1
+                        fp_i = aligned_fps[si][ci]
+                        fp_j = aligned_fps[sj][cj]
+                        sc = compute_spatial_correlation(fp_i, fp_j)
+                        if sc < spatial_corr_floor:
+                            # record the failing pair for histograms
+                            di = aligned_centroid_locations[si][ci]
+                            dj = aligned_centroid_locations[sj][cj]
+                            dpx = float(np.sqrt(np.sum((di - dj) ** 2)))
+                            vetoed_centroid_um.append(dpx * float(cfg.microns_per_pixel))
+                            vetoed_spatial_corr.append(float(sc))
+                            veto = True
+                            break
+                if veto:
+                    # dissolve this multi-session cluster into singletons (keep first session only)
+                    for s_idx in present_sessions[1:]:
+                        filtered_map[cluster_idx, int(s_idx)] = 0
+                    n_vetoed_clusters += 1
+
+            cell_to_index_map = filtered_map
+        else:
+            cell_to_index_map = centroid_primary_map
+
+        # Recompute probabilistic accuracy on FINAL map (post-veto if dual_model enabled)
+        p_same_vec, p_different_vec, accuracy_scores = estimate_registration_accuracy(
+            cell_to_index_map,
+            all_to_all_p_same,
+            data_dist["all_to_all_indexes"],
+            threshold=cfg.p_same_threshold,
+        )
+
+        # Recompute cluster score distributions on FINAL map (so any downstream plots match the dual output)
+        try:
+            scores_out = compute_scores_matlab(
+                cell_to_index_map, data_dist["all_to_all_indexes"], all_to_all_p_same, n_sessions
             )
+            cluster_scores = dict(
+                cell_scores=scores_out[0],
+                cell_scores_positive=scores_out[1],
+                cell_scores_negative=scores_out[2],
+                cell_scores_exclusive=scores_out[3],
+                p_same_registered_pairs=scores_out[4],
+            )
+        except Exception:
+            pass
 
-            # ------------------------------------------------------------------
-            # Auto-flex: optionally choose between the probabilistic result and the IoU+Hungarian candidate.
-            # We score each by (match_count * frac_within_target) / (1 + median_r_um).
-            # ------------------------------------------------------------------
-            if use_flex and (simple_candidate is not None) and bool(getattr(cfg, 'auto_flex_choose_best', True)):
-                target_um = float(getattr(cfg, 'auto_flex_disp_target_um', 2.0))
-
-                dx_p, dy_p = compute_registered_pair_displacements(cell_to_index_map, aligned_centroid_locations, ref_idx)
-                q_p = displacement_quality(dx_p, dy_p, cfg.microns_per_pixel, target_um=target_um)
-                q_s = simple_candidate.get('quality', {})
-
-                def _score(q):
-                    try:
-                        mc = float(q.get('match_count', 0.0))
-                    except Exception:
-                        mc = 0.0
-                    try:
-                        frac = float(q.get('frac_within_target', 0.0))
-                    except Exception:
-                        frac = 0.0
-                    try:
-                        med = float(q.get('median_r_um', 1e9))
-                    except Exception:
-                        med = 1e9
-                    if not np.isfinite(frac):
-                        frac = 0.0
-                    if not np.isfinite(med):
-                        med = 1e9
-                    return mc * frac / (1.0 + med)
-
-                sp = _score(q_p)
-                ss = _score(q_s)
-
-                try:
-                    flex_debug['prob_quality'] = q_p
-                    flex_debug['prob_score'] = float(sp)
-                    flex_debug['iou_score'] = float(ss)
-                except Exception:
-                    pass
-
-                if ss > sp:
-                    print(f"  ⚡ auto-flex selected IoU+Hungarian (score {ss:.3f} > {sp:.3f}).")
-                    cell_to_index_map = simple_candidate['cell_to_index_map']
-                    centroid_distance_map = simple_candidate['centroid_distance_map']
-                    spatial_correlation_map = simple_candidate['iou_map']
-                    registered_distances = simple_candidate['registered_distances']
-                    non_registered_distances = simple_candidate['non_registered_distances']
-                    model_used = 'Simple IoU+Hungarian (auto-flex)'
-                    initial_metric_threshold = float(getattr(cfg, 'simple_iou_threshold', 0.25))
-                    p_same_models = dict(auto_flex_overrode_probabilistic=True)
-                    try:
-                        flex_debug['selected'] = 'iou_hungarian'
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        flex_debug['selected'] = 'probabilistic'
-                    except Exception:
-                        pass
+        p_same_models = dict(
+            model_used=model_used,
+            best_model_string=best_model_string if 'best_model_string' in locals() else model_used,
+            dual_model=use_dual_model,
+            spatial_corr_floor=spatial_corr_floor,
+            n_vetoed_clusters=int(n_vetoed_clusters) if 'n_vetoed_clusters' in locals() else 0,
+            number_of_bins=number_of_bins,
+            centers_of_bins=centers_of_bins,
+            p_same_threshold=cfg.p_same_threshold,
+            # Centroid-distance model
+            p_same_given_centroid_distance=p_same_given_centroid_distance,
+            centroid_same_model=centroid_same_model,
+            centroid_different_model=centroid_diff_model,
+            centroid_mixture_model=centroid_mixture_model,
+            centroid_intersection=centroid_intersection,
+            centroid_best_model=centroid_best_model,
+            centroid_overlap_mse=centroid_overlap_mse,
+            # Spatial-correlation model
+            p_same_given_spatial_correlation=p_same_given_spatial_correlation,
+            spatial_same_model=corr_same_model,
+            spatial_different_model=corr_diff_model,
+            spatial_mixture_model=corr_mixture_model,
+            spatial_intersection=corr_intersection,
+            spatial_best_model=corr_best_model,
+            spatial_overlap_mse=corr_overlap_mse,
+            # Clustering outputs
+            registered_cells_centroids=registered_cells_centroids,
+            cluster_scores=cluster_scores,
+            p_same_vec=p_same_vec,
+            p_different_vec=p_different_vec,
+            accuracy_scores=accuracy_scores,
+        )
 
         # Step 6: Save results
         print("  Saving registration results...")
@@ -2915,14 +2332,9 @@ class CellRegPy:
                 'reference_session_index': int(ref_idx),
                 'scores': maximal_cross_correlation,
                 'translations': alignment_translations,
-                'sources': alignment_sources,
-                'raw_image_correlation': raw_image_correlation,
-                'aligned_image_correlation': aligned_image_correlation,
             },
             'n_sessions': n_sessions,
             'p_same_models': p_same_models,
-            'auto_flex': flex_debug if use_flex else None,
-            'iou_candidate': simple_candidate if use_flex else None,
             'config': {
                 'microns_per_pixel': cfg.microns_per_pixel,
                 'maximal_distance': cfg.maximal_distance,
@@ -3012,56 +2424,54 @@ class CellRegPy:
                     also_pdf=also_pdf,
                 )
 
-                if not skip_probabilistic:
+                # Stage 3 — displacement + mixture models
+                plot_x_y_displacements(
+                    data_dist['neighbors_x_displacements'],
+                    data_dist['neighbors_y_displacements'],
+                    cfg.microns_per_pixel,
+                    max_dist_px,
+                    number_of_bins,
+                    centers_of_bins,
+                    fig_dir_s,
+                    show=show_figs,
+                    also_pdf=also_pdf,
+                )
 
-                    # Stage 3 — displacement + mixture models
-                    plot_x_y_displacements(
-                        data_dist['neighbors_x_displacements'],
-                        data_dist['neighbors_y_displacements'],
-                        cfg.microns_per_pixel,
-                        max_dist_px,
-                        number_of_bins,
-                        centers_of_bins,
-                        fig_dir_s,
-                        show=show_figs,
-                        also_pdf=also_pdf,
-                    )
+                p_centroid = _extract_p_from_model_string(centroid_best_model)
+                p_spatial = _extract_p_from_model_string(corr_best_model)
+                centroid_dist_distribution = _compute_histogram_distribution(
+                    data_dist['neighbors_centroid_distances'], centers_of_bins[0], number_of_bins, scale=cfg.microns_per_pixel
+                )
+                spatial_corr_distribution = _compute_histogram_distribution(
+                    np.asarray(data_dist['neighbors_spatial_correlations']).ravel()[np.asarray(data_dist['neighbors_spatial_correlations']).ravel() >= 0],
+                    centers_of_bins[1], number_of_bins, scale=1.0
+                )
 
-                    p_centroid = _extract_p_from_model_string(centroid_best_model)
-                    p_spatial = _extract_p_from_model_string(corr_best_model)
-                    centroid_dist_distribution = _compute_histogram_distribution(
-                        data_dist['neighbors_centroid_distances'], centers_of_bins[0], number_of_bins, scale=cfg.microns_per_pixel
-                    )
-                    spatial_corr_distribution = _compute_histogram_distribution(
-                        np.asarray(data_dist['neighbors_spatial_correlations']).ravel()[np.asarray(data_dist['neighbors_spatial_correlations']).ravel() >= 0],
-                        centers_of_bins[1], number_of_bins, scale=1.0
-                    )
-
-                    plot_models(
-                        np.array([p_centroid]),
-                        data_dist['NN_centroid_distances'],
-                        data_dist['NNN_centroid_distances'],
-                        centroid_dist_distribution,
-                        centroid_same_model,
-                        centroid_diff_model,
-                        centroid_mixture_model,
-                        centroid_intersection,
-                        centers_of_bins[0],
-                        spatial_correlations_model_parameters=np.array([p_spatial]),
-                        NN_spatial_correlations=data_dist['NN_spatial_correlations'],
-                        NNN_spatial_correlations=data_dist['NNN_spatial_correlations'],
-                        spatial_correlations_distribution=spatial_corr_distribution,
-                        spatial_correlations_model_same_cells=corr_same_model,
-                        spatial_correlations_model_different_cells=corr_diff_model,
-                        spatial_correlations_model_weighted_sum=corr_mixture_model,
-                        spatial_correlation_intersection=corr_intersection,
-                        centers_of_bins_corr=centers_of_bins[1],
-                        microns_per_pixel=cfg.microns_per_pixel,
-                        maximal_distance=max_dist_px,
-                        out_dir=fig_dir_s,
-                        show=show_figs,
-                        also_pdf=also_pdf,
-                    )
+                plot_models(
+                    np.array([p_centroid]),
+                    data_dist['NN_centroid_distances'],
+                    data_dist['NNN_centroid_distances'],
+                    centroid_dist_distribution,
+                    centroid_same_model,
+                    centroid_diff_model,
+                    centroid_mixture_model,
+                    centroid_intersection,
+                    centers_of_bins[0],
+                    spatial_correlations_model_parameters=np.array([p_spatial]),
+                    NN_spatial_correlations=data_dist['NN_spatial_correlations'],
+                    NNN_spatial_correlations=data_dist['NNN_spatial_correlations'],
+                    spatial_correlations_distribution=spatial_corr_distribution,
+                    spatial_correlations_model_same_cells=corr_same_model,
+                    spatial_correlations_model_different_cells=corr_diff_model,
+                    spatial_correlations_model_weighted_sum=corr_mixture_model,
+                    spatial_correlation_intersection=corr_intersection,
+                    centers_of_bins_corr=centers_of_bins[1],
+                    microns_per_pixel=cfg.microns_per_pixel,
+                    maximal_distance=max_dist_px,
+                    out_dir=fig_dir_s,
+                    show=show_figs,
+                    also_pdf=also_pdf,
+                )
 
                 # Stage 6 (dual) — compute accepted pair metrics from FINAL map
                 accepted_centroid_um = []
@@ -3115,69 +2525,6 @@ class CellRegPy:
                 # Stage 6 projections + overlap (final map only)
                 plot_all_registered_projections(aligned_fps, cell_to_index_map, fig_dir_s, show=show_figs, also_pdf=also_pdf, stage_label='Stage 6 (dual)')
                 plot_pairwise_session_overlap(aligned_fps, cell_to_index_map, fig_dir_s, show=show_figs)
-
-                # Stage 6b — registered-pair displacement cloud for the FINAL map (should be near 0,0 if matches are correct)
-                try:
-                    dx_f, dy_f = compute_registered_pair_displacements(cell_to_index_map, aligned_centroid_locations, ref_idx)
-                    q_f = displacement_quality(dx_f, dy_f, cfg.microns_per_pixel, target_um=float(getattr(cfg, 'auto_flex_disp_target_um', 2.0)))
-                    fig = plt.figure(figsize=(5, 5))
-                    ax = fig.add_subplot(111)
-                    ax.scatter(dx_f * cfg.microns_per_pixel, dy_f * cfg.microns_per_pixel, s=6)
-                    ax.axhline(0.0)
-                    ax.axvline(0.0)
-                    ax.set_xlabel("dx (µm)")
-                    ax.set_ylabel("dy (µm)")
-                    ax.set_title(f"Registered pair displacements (FINAL)\nN={int(q_f.get('match_count',0))} | med r={q_f.get('median_r_um', float('nan')):.2f} µm")
-                    savefig_both(fig, os.path.join(fig_dir_s, "Stage6b_registered_displacements_FINAL"), also_pdf=also_pdf)
-                    if close_figs and (not show_figs):
-                        plt.close(fig)
-                except Exception:
-                    pass
-
-                # Stage 7 — IoU+Hungarian candidate QC (auto-flex)
-                if use_flex and (simple_candidate is not None):
-                    try:
-                        plot_all_registered_projections(aligned_fps, simple_candidate['cell_to_index_map'], fig_dir_s, show=show_figs, also_pdf=also_pdf, stage_label='Stage 7 (IoU+Hungarian candidate)')
-                        plot_pairwise_session_overlap(aligned_fps, simple_candidate['cell_to_index_map'], fig_dir_s, show=show_figs)
-
-                        dx_s, dy_s = compute_registered_pair_displacements(simple_candidate['cell_to_index_map'], aligned_centroid_locations, ref_idx)
-                        q_s = simple_candidate.get('quality', {})
-                        fig = plt.figure(figsize=(5, 5))
-                        ax = fig.add_subplot(111)
-                        ax.scatter(dx_s * cfg.microns_per_pixel, dy_s * cfg.microns_per_pixel, s=6)
-                        ax.axhline(0.0)
-                        ax.axvline(0.0)
-                        ax.set_xlabel("dx (µm)")
-                        ax.set_ylabel("dy (µm)")
-                        ax.set_title(f"Registered pair displacements (IoU)\nN={int(q_s.get('match_count',0))} | med r={q_s.get('median_r_um', float('nan')):.2f} µm")
-                        savefig_both(fig, os.path.join(fig_dir_s, "Stage7_registered_displacements_IOU"), also_pdf=also_pdf)
-                        if close_figs and (not show_figs):
-                            plt.close(fig)
-                    except Exception:
-                        pass
-
-                # Stage 2b — auto-flex sweep summary (if available)
-                if use_flex and isinstance(flex_debug, dict) and ('sweep' in flex_debug):
-                    try:
-                        rows = [r for r in flex_debug.get('sweep', []) if isinstance(r, dict) and ('error' not in r)]
-                        if len(rows) > 0:
-                            xs = [float(r.get('max_dist_um', float('nan'))) for r in rows]
-                            fr = [float(r.get('frac_within_target', float('nan'))) for r in rows]
-                            mr = [float(r.get('median_r_um', float('nan'))) for r in rows]
-                            fig = plt.figure(figsize=(6, 4))
-                            ax = fig.add_subplot(111)
-                            ax.plot(xs, fr, marker='o')
-                            ax.set_xlabel("maximal_distance (µm)")
-                            ax.set_ylabel(f"frac within {float(flex_debug.get('target_um', 2.0)):.1f} µm")
-                            ax2 = ax.twinx()
-                            ax2.plot(xs, mr, marker='s')
-                            ax2.set_ylabel("median r (µm)")
-                            ax.set_title("Auto-flex sweep metrics")
-                            savefig_both(fig, os.path.join(fig_dir_s, "Stage2b_auto_flex_sweep_metrics"), also_pdf=also_pdf)
-                            if close_figs and (not show_figs):
-                                plt.close(fig)
-                    except Exception:
-                        pass
 
                 if close_figs and (not show_figs):
                     plt.close('all')
@@ -3562,7 +2909,7 @@ class CellRegPy:
         # Also save as .mat for MATLAB compatibility
         # Save table even if mouse_data export fails
         try:
-            table_dict = sanitize_for_mat(mouse_table.to_dict('list'))
+            table_dict = mouse_table.to_dict('list')
             savemat(str(mouse_folder / 'mouse_table.mat'),
                    {'mouse_table': table_dict},
                    do_compression=True,
@@ -3895,45 +3242,6 @@ def compute_centroid_projections(centroid_locations: List[np.ndarray],
     return projections
 
 
-def make_alignment_image_from_footprints(spatial_footprints: np.ndarray,
-                                         pixel_weight_threshold: float = 0.5,
-                                         blur_sigma: float = 1.0) -> np.ndarray:
-    """
-    Build a single 2D alignment image from a stack of spatial footprints.
-
-    This lets the mean-image aligner backend operate on spatial-footprint
-    projections when mean-image alignment fails.
-
-    Args:
-        spatial_footprints: Array of shape (n_cells, y, x)
-        pixel_weight_threshold: Per-cell normalized threshold before projection
-        blur_sigma: Optional mild blur applied to the final projection
-
-    Returns:
-        2D float image suitable for MeanImageAligner.align()
-    """
-    fps = np.asarray(spatial_footprints, dtype=np.float32)
-    if fps.ndim != 3:
-        raise ValueError(f"Expected (n_cells, y, x) footprints, got shape {fps.shape}")
-
-    if fps.shape[0] == 0:
-        return np.zeros(fps.shape[1:], dtype=np.float32)
-
-    fps_max = np.nanmax(fps, axis=(1, 2), keepdims=True)
-    fps_max[~np.isfinite(fps_max)] = 0
-    fps_max[fps_max == 0] = 1
-    norm = fps / fps_max
-    norm[~np.isfinite(norm)] = 0
-
-    if pixel_weight_threshold is not None and pixel_weight_threshold > 0:
-        norm[norm < float(pixel_weight_threshold)] = 0
-
-    proj = np.nansum(norm, axis=0).astype(np.float32)
-    if blur_sigma and blur_sigma > 0:
-        proj = gaussian_filter(proj, blur_sigma)
-    return proj
-
-
 # ============================================================================ #
 #                       PROBABILISTIC MODELING                                 #
 
@@ -3988,181 +3296,6 @@ def choose_best_model(centroid_overlap_mse: float,
 
     return "Centroid distance" if c < r else "Spatial correlation"
 
-
-def initial_registration_iou_hungarian(spatial_footprints: list[np.ndarray],
-                                       centroid_locations: list[np.ndarray],
-                                       *,
-                                       reference_session_index: int,
-                                       maximal_distance: float,
-                                       mask_threshold: float = 0.20,
-                                       iou_threshold: float = 0.25,
-                                       cost_beta: float = 0.25
-                                       ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Deterministic registration using IoU + Hungarian assignment.
-
-    Intended as a fallback when sessions are already extremely similar, where
-    probabilistic mixture modeling (CellReg) can become ill-posed.
-
-    Strategy:
-      - Anchor clusters to the reference session.
-      - For each other session, compute candidate matches within maximal_distance.
-      - Cost = (1 - IoU) + cost_beta * (dist / maximal_distance)
-      - Solve one-to-one assignment via Hungarian algorithm.
-      - Accept matches only if IoU >= iou_threshold AND dist <= maximal_distance.
-      - Add unmatched cells as new clusters (present only in that session).
-
-    Notes:
-      - This is reference-anchored. Cells absent in the reference but shared across
-        later sessions will not be merged across those later sessions in this mode.
-
-    Returns:
-      (cell_to_index_map, centroid_distance_map, iou_map, registered_dists, non_registered_dists)
-      All maps are 1-indexed like MATLAB.
-    """
-    from scipy.optimize import linear_sum_assignment
-
-    n_sessions = len(spatial_footprints)
-    if n_sessions == 0:
-        return (np.zeros((0, 0), dtype=int),
-                np.zeros((0, 0), dtype=float),
-                np.zeros((0, 0), dtype=float),
-                np.array([]), np.array([]))
-
-    ref_idx = int(reference_session_index)
-    if not (0 <= ref_idx < n_sessions):
-        raise ValueError(f"reference_session_index out of range: {ref_idx}")
-
-    # Reference cells
-    ref_fps = spatial_footprints[ref_idx]
-    n_ref = 0 if ref_fps is None else int(ref_fps.shape[0])
-
-    cell_to_index_map = np.zeros((n_ref, n_sessions), dtype=int)
-    if n_ref > 0:
-        cell_to_index_map[:, ref_idx] = np.arange(1, n_ref + 1)
-
-    # Store per-cluster metrics vs each session (NaN where not applicable)
-    centroid_distance_map = np.full((n_ref, n_sessions), np.nan, dtype=float)
-    iou_map = np.full((n_ref, n_sessions), np.nan, dtype=float)
-    if n_ref > 0:
-        centroid_distance_map[:, ref_idx] = 0.0
-        iou_map[:, ref_idx] = 1.0
-
-    reg_dists = []
-    nonreg_dists = []
-
-    # Precompute reference masks + pixel indices for IoU
-    def _roi_indices(roi2d: np.ndarray) -> np.ndarray:
-        r = np.asarray(roi2d, dtype=float)
-        mx = float(np.nanmax(r)) if r.size else 0.0
-        if not np.isfinite(mx) or mx <= 0:
-            return np.array([], dtype=np.int32)
-        thr = mx * float(mask_threshold)
-        idx = np.flatnonzero(r >= thr).astype(np.int32)
-        return idx
-
-    ref_idx_lists = []
-    if n_ref > 0:
-        for k in range(n_ref):
-            ref_idx_lists.append(_roi_indices(ref_fps[k]))
-
-    max_dist = float(maximal_distance)
-
-    # Helper: IoU of sparse index lists
-    def _iou(idx_a: np.ndarray, idx_b: np.ndarray) -> float:
-        if idx_a.size == 0 or idx_b.size == 0:
-            return 0.0
-        inter = np.intersect1d(idx_a, idx_b, assume_unique=False).size
-        union = idx_a.size + idx_b.size - inter
-        if union <= 0:
-            return 0.0
-        return float(inter) / float(union)
-
-    # Reference centroids (pixels)
-    ref_cents = centroid_locations[ref_idx]
-    if ref_cents is None:
-        ref_cents = np.zeros((n_ref, 2), dtype=float)
-
-    for s in range(n_sessions):
-        if s == ref_idx:
-            continue
-
-        mov_fps = spatial_footprints[s]
-        mov_cents = centroid_locations[s]
-        n_mov = 0 if mov_fps is None else int(mov_fps.shape[0])
-
-        if n_mov == 0:
-            continue
-
-        mov_idx_lists = [_roi_indices(mov_fps[k]) for k in range(n_mov)]
-
-        # Build cost matrix (n_ref x n_mov)
-        big = 1e6
-        cost = np.full((n_ref, n_mov), big, dtype=float)
-
-        # Candidate gating by centroid distance
-        if n_ref > 0 and ref_cents is not None and mov_cents is not None and len(ref_cents) and len(mov_cents):
-            for j in range(n_mov):
-                d = np.sqrt(np.sum((ref_cents - mov_cents[j]) ** 2, axis=1))
-                cand = np.where(d <= max_dist)[0]
-                if cand.size == 0:
-                    continue
-                for r in cand:
-                    iou = _iou(ref_idx_lists[r], mov_idx_lists[j])
-                    # Lower is better
-                    cost[r, j] = (1.0 - iou) + float(cost_beta) * (float(d[r]) / max_dist)
-        else:
-            # No centroids: compute IoU for all pairs
-            for r in range(n_ref):
-                for j in range(n_mov):
-                    iou = _iou(ref_idx_lists[r], mov_idx_lists[j])
-                    cost[r, j] = (1.0 - iou)
-
-        if n_ref == 0:
-            # No reference cells: every cell becomes its own cluster
-            extra = np.zeros((n_mov, n_sessions), dtype=int)
-            extra[:, s] = np.arange(1, n_mov + 1)
-            cell_to_index_map = np.vstack([cell_to_index_map, extra]) if cell_to_index_map.size else extra
-            continue
-
-        row_ind, col_ind = linear_sum_assignment(cost)
-
-        assigned_ref = set()
-        assigned_mov = set()
-
-        for r, j in zip(row_ind.tolist(), col_ind.tolist()):
-            if not np.isfinite(cost[r, j]) or cost[r, j] >= big:
-                continue
-            dist = float(np.sqrt(np.sum((ref_cents[r] - mov_cents[j]) ** 2))) if (ref_cents is not None and mov_cents is not None) else float('nan')
-            iou = _iou(ref_idx_lists[r], mov_idx_lists[j])
-
-            if (np.isfinite(dist) and dist <= max_dist) and (iou >= float(iou_threshold)):
-                cell_to_index_map[r, s] = int(j + 1)  # 1-indexed
-                centroid_distance_map[r, s] = dist
-                iou_map[r, s] = iou
-                reg_dists.append(dist)
-                assigned_ref.add(r)
-                assigned_mov.add(j)
-            else:
-                if np.isfinite(dist):
-                    nonreg_dists.append(dist)
-
-        # Add unmatched moving cells as new clusters
-        unmatched = [j for j in range(n_mov) if j not in assigned_mov]
-        if unmatched:
-            extra = np.zeros((len(unmatched), n_sessions), dtype=int)
-            extra[:, s] = np.array(unmatched, dtype=int) + 1
-            cell_to_index_map = np.vstack([cell_to_index_map, extra])
-
-            # Expand metric maps with NaN rows
-            extra_nan = np.full((len(unmatched), n_sessions), np.nan, dtype=float)
-            centroid_distance_map = np.vstack([centroid_distance_map, extra_nan])
-            iou_map = np.vstack([iou_map, extra_nan])
-
-    return (cell_to_index_map,
-            centroid_distance_map,
-            iou_map,
-            np.asarray(reg_dists, dtype=float),
-            np.asarray(nonreg_dists, dtype=float))
 
 def initial_registration_centroid_distances_custom(centroid_locations: list[np.ndarray],
                                                    maximal_distance: float,
@@ -5801,41 +4934,26 @@ def cluster_cells(cell_to_index_map: np.ndarray,
 #                             CONVENIENCE API                                  #
 # ============================================================================ #
 
-
 def run_pipeline(folder_path: Union[str, Path],
                  cfg: Optional[CellRegConfig] = None,
                  *,
-                 export_csv: bool = True,
-                 save_figures: Optional[bool] = None,
-                 figures_visibility: Optional[str] = None,
-                 also_pdf: Optional[bool] = None,
-                 spatial_corr_floor: Optional[float] = None) -> Tuple[pd.DataFrame, Dict]:
+                 spatial_corr_floor: float = 0.5,
+                 save_figures: bool = True,
+                 figures_visibility: str = 'off',
+                 export_csv: bool = True) -> Tuple[pd.DataFrame, Dict]:
     """One-call entrypoint: run the full CellRegPy pipeline on a mouse folder.
 
-    This wrapper **does not** override your modeling choices. It respects `cfg`:
-
-    - `cfg.model_type`:
-        * "auto" (default): fit BOTH centroid-distance and spatial-correlation models,
-          choose the best by overlap MSE (MATLAB-like). If the two MSEs are a near-tie
-          (`cfg.model_tie_rel_tol`), and `cfg.dual_on_model_tie=True`, CellRegPy will
-          enable the dual-model mode (centroid-primary clustering + spatial-correlation veto).
-        * "Centroid distance" or "Spatial correlation": force that single model.
-
-    - Similarity fallback:
-        * If `cfg.auto_simple_on_high_similarity` and/or `cfg.auto_flex_on_high_peak`
-          triggers, probabilistic modeling is skipped and SIMPLE IoU+Hungarian is used.
-
-    - Alignment:
-        * Controlled by `cfg.alignment_fallback_mode`.
-          For speed, the current default in `CellRegConfig` is `'none'` (mean-image only).
-          No spatial-footprint alignment is performed unless you explicitly enable it later.
+    This enforces the Stage-6 dual-model approach:
+        1) centroid-distance probabilistic model drives clustering
+        2) spatial correlation is used ONLY as a post-hoc veto (floor cutoff)
 
     Args:
         folder_path: Mouse folder containing session subfolders.
         cfg: Optional CellRegConfig. If None, defaults are used.
+        spatial_corr_floor: Spatial correlation veto threshold (default 0.5).
+        save_figures: Save per-FOV figures into 1_CellReg/FOV*/Figures (default True).
+        figures_visibility: 'on' to display; 'off' to save+close (default 'off').
         export_csv: Save mouse_table.csv and mouse_table_wide.csv into 1_CellReg (default True).
-        save_figures / figures_visibility / also_pdf / spatial_corr_floor:
-            Optional convenience overrides. If None, the value already in `cfg` is used.
 
     Returns:
         (mouse_table, mouse_data)
@@ -5843,18 +4961,16 @@ def run_pipeline(folder_path: Union[str, Path],
     mouse_folder = Path(folder_path)
     cfg = cfg or CellRegConfig()
 
-    # Optional convenience overrides (prefer keeping these in CellRegConfig)
-    if save_figures is not None:
-        cfg.save_figures = bool(save_figures)
-    if figures_visibility is not None:
-        cfg.figures_visibility = str(figures_visibility)
-    if also_pdf is not None:
-        cfg.also_pdf = bool(also_pdf)
-    if spatial_corr_floor is not None:
-        cfg.spatial_corr_floor = float(spatial_corr_floor)
+    # Enforce dual-model final registration
+    cfg.model_type = 'Centroid distance'
+    cfg.dual_model = True
+    cfg.apply_spatial_floor_filter = True
+    cfg.spatial_corr_floor = float(spatial_corr_floor)
 
-    # Close figures when not explicitly showing them (keeps runs fast)
-    cfg.close_figures = (str(getattr(cfg, 'figures_visibility', 'off')).lower() != 'on')
+    # Figures
+    cfg.save_figures = bool(save_figures)
+    cfg.figures_visibility = str(figures_visibility)
+    cfg.close_figures = True
 
     cellreg = CellRegPy(cfg)
     mouse_table, mouse_data = cellreg.run([mouse_folder])
@@ -5866,14 +4982,13 @@ def run_pipeline(folder_path: Union[str, Path],
             mouse_table.to_csv(out_dir / 'mouse_table.csv', index=False)
             wide = (mouse_table
                     .pivot_table(index='cellRegID', columns='Session', values='suite2pID',
-                                 aggfunc='first')
+                                 aggfunc='first', fill_value=0)
                     .sort_index())
             wide.to_csv(out_dir / 'mouse_table_wide.csv')
         except Exception:
             pass
 
     return mouse_table, mouse_data
-
 
 __all__ = [
     # Main classes
@@ -5895,7 +5010,6 @@ __all__ = [
     'compute_footprint_projections',
     'compute_centroids',
     'compute_centroid_projections',
-    'make_alignment_image_from_footprints',
     'gaussfit',
     # Probabilistic modeling & registration
     'estimate_num_bins',
